@@ -271,7 +271,8 @@ class MegatronLMEval(LM):
 
         For Expert Parallelism (EP > 1):
         - EP cannot be combined with TP or PP (must have TP=1, PP=1)
-        - EP must equal devices (each expert parallel rank is also a data parallel rank)
+        - devices must be divisible by EP
+        - EP doesn't modify DP, so implicitly this works with both single GPU and data parallel configurations, as long as TP=1 and PP=1.
 
         Note: Pipeline Parallelism (PP > 1) is NOT currently supported.
         """
@@ -290,11 +291,10 @@ class MegatronLMEval(LM):
                     f"Tensor Parallelism (TP={tp}) or Pipeline Parallelism (PP={pp}). "
                     f"Please use EP alone with TP=1, PP=1."
                 )
-            # EP must equal devices
-            if devices != ep:
+            # Match Megatron's requirement that expert groups divide the world size.
+            if devices % ep != 0:
                 raise ValueError(
-                    f"Invalid Expert Parallelism configuration: devices={devices}, EP={ep}. "
-                    f"When using Expert Parallelism (EP > 1), devices must equal expert-model-parallel-size."
+                    f"Devices ({devices}) must be divisible by EP ({ep})."
                 )
 
         # At this point, pp == 1 is guaranteed (pp > 1 was rejected above)
@@ -445,16 +445,7 @@ class MegatronLMEval(LM):
                 else 0
             )
 
-            if self._parallelism_mode == "data_parallel":
-                # Data Parallelism: each rank is a separate worker processing different data
-                self._rank = self._global_rank
-                self._world_size = devices
-            else:
-                # Model Parallelism (TP/PP): all ranks work together as a single logical worker
-                # From lm_eval's perspective, this is a single worker (world_size=1)
-                # because TP/PP handles computation distribution, not data distribution
-                self._rank = 0
-                self._world_size = 1
+            self._set_parallelism(devices)
 
             eval_logger.info(
                 f"Parallel state - TP rank: {self._tp_rank}, PP rank: {self._pp_rank}, "
@@ -606,6 +597,19 @@ class MegatronLMEval(LM):
 
         finally:
             sys.argv = original_argv
+
+    def _set_parallelism(self, devices: int):
+        """Map Megatron parallelism mode to lm-eval rank/world-size semantics."""
+        if self._parallelism_mode == "data_parallel":
+            # Data Parallelism: each rank is a separate worker processing different data.
+            self._rank = self._global_rank
+            self._world_size = devices
+        else:
+            # Model Parallelism (TP/PP): all ranks work together as a single logical worker.
+            # From lm_eval's perspective, this is a single worker because TP/PP handles
+            # computation distribution, not data distribution.
+            self._rank = 0
+            self._world_size = 1
 
     @property
     def eot_token_id(self) -> int:
@@ -959,7 +963,7 @@ class MegatronLMEval(LM):
                 attention_mask_list, dtype=torch.long, device=self.device
             )
 
-            # Forward pass (handles TP/PP internally)
+            # Forward pass (handles TP/PP and EP internally)
             logits = self._model_forward(input_ids, attention_mask=attention_mask)
 
             # Compute log probabilities
