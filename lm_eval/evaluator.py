@@ -579,8 +579,28 @@ def evaluate(
             padding_requests[reqtype] += numpad
 
     ### Run LM on inputs, get all outputs ###
+    if lm.world_size > 1:
+        # Include reqtypes that only exist on other ranks so empty shards still enter.
+        gathered_reqtypes = lm.accelerator.gather_object(
+            sorted(set(requests) | set(padding_requests))
+        )
+        all_reqtypes = sorted(set(itertools.chain.from_iterable(gathered_reqtypes)))
+        padding_examples = {}
+        for reqtype in all_reqtypes:
+            # Empty ranks need a real request shape for padding-only forward passes.
+            local_example = requests[reqtype][0] if len(requests[reqtype]) > 0 else None
+            gathered_examples = lm.accelerator.gather_object(local_example)
+            padding_examples[reqtype] = next(
+                (example for example in gathered_examples if example is not None),
+                None,
+            )
+    else:
+        all_reqtypes = sorted(requests)
+        padding_examples = {}
+
     # execute each type of request
-    for reqtype, reqs in requests.items():
+    for reqtype in all_reqtypes:
+        reqs = requests[reqtype]
         eval_logger.info(f"Running {reqtype} requests")
         # create `K` copies of each request `req` based off `K = req.repeats`
         cloned_reqs = []
@@ -588,8 +608,13 @@ def evaluate(
             cloned_reqs.extend([req] * req.repeats)
 
         if (lm.world_size > 1) and (padding_requests[reqtype] > 0):
+            padding_req = reqs[-1] if reqs else padding_examples[reqtype]
+            if padding_req is None:
+                raise ValueError(
+                    f"Could not find a padding request for distributed reqtype {reqtype}"
+                )
             for _ in range(padding_requests[reqtype]):
-                cloned_reqs.extend([req] * req.repeats)
+                cloned_reqs.extend([padding_req] * padding_req.repeats)
 
         # run requests through model
         resps = getattr(lm, reqtype)(cloned_reqs)
@@ -607,12 +632,17 @@ def evaluate(
     # TODO: del model here, maybe (idea: allow user to specify device of e.g. reward model separately)
     for task_output, limit in zip(eval_tasks, limits, strict=True):
         task = task_output.task
-        task.apply_filters()
 
-        # Skip post-processing for ranks with no instances (data parallel with small datasets)
-        # The gather will collect empty results from this rank
+        # Skip post-processing for ranks with no instances (data parallel with
+        # small datasets, or multi_turn_generate when world_size > docs-for-task,
+        # leaving some ranks an empty shard). Must come BEFORE apply_filters():
+        # Filter.apply does `zip(*(... for inst in instances))`, which raises
+        # `ValueError: not enough values to unpack` on an empty instance list.
+        # The gather will collect empty results from this rank.
         if len(task.instances) == 0:
             continue
+
+        task.apply_filters()
 
         ### Collect values of metrics on all datapoints ###
         # # unpack results and sort back in order and return control to Task
@@ -692,11 +722,20 @@ def evaluate(
                         itertools.chain.from_iterable(full_samples)
                     )
 
-            # then collect metrics across all ranks
-            for metrics in task_output.sample_metrics:
+            # then collect metrics across all ranks. Agree on a consistent key
+            # set first: a rank with an empty shard (world_size > docs-for-task,
+            # reachable for multi_turn_generate on small/limited tasks, or any DP
+            # run with fewer docs than ranks) has no `sample_metrics` keys and
+            # would otherwise issue fewer `gather_object` collectives than its
+            # peers — desyncing the gather and deadlocking the job.
+            local_keys = list(task_output.sample_metrics.keys())
+            gathered_keys = [None] * WORLD_SIZE
+            torch.distributed.all_gather_object(gathered_keys, local_keys)
+            all_keys = sorted({k for keys in gathered_keys for k in keys})
+            for metrics in all_keys:
                 metric_list = [None] * WORLD_SIZE if RANK == 0 else None
                 torch.distributed.gather_object(
-                    obj=task_output.sample_metrics[metrics],
+                    obj=task_output.sample_metrics.get(metrics, []),
                     object_gather_list=metric_list,
                     dst=0,
                 )
