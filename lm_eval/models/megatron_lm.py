@@ -57,6 +57,7 @@ import logging
 import os
 import sys
 from copy import deepcopy
+from inspect import signature
 
 import torch
 from tqdm import tqdm
@@ -416,11 +417,22 @@ class MegatronLMEval(LM):
         eval_logger.info(f"Initializing Megatron with args: {' '.join(argv[1:])}")
 
         try:
-            # Initialize Megatron
-            initialize_megatron(
-                extra_args_provider=None,
-                args_defaults={"tokenizer_type": kwargs["tokenizer_type"]},
-            )
+            initialize_megatron_params = signature(initialize_megatron).parameters
+            if "args_defaults" in initialize_megatron_params:
+                # Megatron-Core < 0.18 parses arguments inside initialize_megatron.
+                initialize_megatron(
+                    extra_args_provider=None,
+                    args_defaults={"tokenizer_type": kwargs["tokenizer_type"]},
+                )
+            else:
+                # Megatron-Core >= 0.18 parses and stores global args before initialization.
+                from megatron.training.arguments import parse_and_validate_args
+
+                parse_and_validate_args(
+                    extra_args_provider=None,
+                    args_defaults={"tokenizer_type": kwargs["tokenizer_type"]},
+                )
+                initialize_megatron()
 
             args = get_args()
             self._args = args
