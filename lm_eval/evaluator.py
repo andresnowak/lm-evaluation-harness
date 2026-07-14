@@ -49,6 +49,18 @@ if TYPE_CHECKING:
 eval_logger = logging.getLogger(__name__)
 
 
+def _request_group_key(instance) -> tuple[str, str, int]:
+    """Identify requests that a model adapter may batch together."""
+    gen_kwargs = instance.args[1] if instance.request_type == "generate_until" else {}
+    serialized_kwargs = json.dumps(
+        gen_kwargs,
+        sort_keys=True,
+        default=handle_non_serializable,
+        separators=(",", ":"),
+    )
+    return instance.request_type, serialized_kwargs, instance.repeats or 1
+
+
 @positional_deprecated
 def simple_evaluate(
     model: str | LM,
@@ -267,15 +279,21 @@ def simple_evaluate(
         eval_logger.info("Using pre-initialized model")
         lm = model
 
+    uses_megatron_accelerator = getattr(lm, "uses_megatron_accelerator", False)
+    is_main_process = (
+        lm.is_main_process if uses_megatron_accelerator else lm.rank == 0
+    )
+
     if use_cache is not None:
-        eval_logger.info(f"Using cache at {use_cache + '_rank' + str(lm.rank) + '.db'}")
+        cache_rank = lm.cache_rank if uses_megatron_accelerator else lm.rank
+        eval_logger.info(f"Using cache at {use_cache + '_rank' + str(cache_rank) + '.db'}")
         lm = lm_eval.api.model.CachingLM(
             lm,
             use_cache
             # each rank receives a different cache db.
             # necessary to avoid multiple writes to cache at once
             + "_rank"
-            + str(lm.rank)
+            + str(cache_rank)
             + ".db",
         )
 
@@ -382,7 +400,7 @@ def simple_evaluate(
     if verbosity is not None:
         setup_logging(verbosity=verbosity)
 
-    if lm.rank == 0:
+    if is_main_process:
         if isinstance(model, str):
             model_name = model
         elif hasattr(model, "config") and hasattr(model.config, "_name_or_path"):
@@ -492,8 +510,8 @@ def evaluate(
         )
     # tracks all Instances/requests a model must generate output on.
     requests = defaultdict(list)
-    # stores the amount to pad out reqs per req. type so that
-    # number of fwd passes per distributed rank is equal
+    # stores the amount to pad out reqs per req. type for ordinary distributed
+    # models. Adapters with cross-rank forward collectives are aligned below.
     padding_requests = defaultdict(int)
 
     # get lists of group hierarchy and each type of request
@@ -524,6 +542,10 @@ def evaluate(
     # end validation check
 
     # Cache the limit arg.
+    uses_megatron_accelerator = getattr(lm, "uses_megatron_accelerator", False)
+    requires_uniform_request_groups = getattr(
+        lm, "requires_uniform_request_groups", False
+    )
     limit_arg = limit
     limits = []
     for task_output in eval_tasks:
@@ -538,6 +560,7 @@ def evaluate(
             else samples,
             rank=lm.rank,
             world_size=lm.world_size,
+            cache_rank=lm.cache_rank if uses_megatron_accelerator else None,
             cache_requests=cache_requests,
             rewrite_requests_cache=rewrite_requests_cache,
             system_instruction=system_instruction,
@@ -555,12 +578,45 @@ def evaluate(
         )
         if write_out:
             print_writeout(task)
-        # aggregate Instances by LM method requested to get output.
-        for instance in task.instances:
-            reqtype = instance.request_type
-            requests[reqtype].append(instance)
+        if lm.world_size > 1 and requires_uniform_request_groups:
+            # EP ranks process different data shards but join the same model
+            # collectives. Align every task/generation group independently so
+            # regrouping inside generate_until cannot change the forward count.
+            local_groups = defaultdict(list)
+            for instance in task.instances:
+                local_groups[_request_group_key(instance)].append(instance)
 
-        if lm.world_size > 1:
+            gathered_groups = lm.accelerator.gather_object(
+                {
+                    key: (len(group), group[-1])
+                    for key, group in local_groups.items()
+                }
+            )
+            group_keys = sorted(
+                set(itertools.chain.from_iterable(gathered_groups))
+            )
+            for group_key in group_keys:
+                local_group = local_groups[group_key]
+                group_size = max(
+                    groups.get(group_key, (0, None))[0]
+                    for groups in gathered_groups
+                )
+                # Here we use a real task instance to be able to create our paddings so they have the same rules (because we need each task to have things like the same amount of max gen toks)
+                padding_example = next(
+                    groups[group_key][1]
+                    for groups in gathered_groups
+                    if group_key in groups
+                )
+                requests[group_key[0]].extend(local_group)
+                requests[group_key[0]].extend(
+                    [padding_example] * (group_size - len(local_group))
+                )
+        else:
+            # Aggregate Instances by LM method requested to get output.
+            for instance in task.instances:
+                requests[instance.request_type].append(instance)
+
+        if lm.world_size > 1 and not requires_uniform_request_groups:
             import torch
 
             instances_rnk = torch.tensor(len(task._instances), device=lm.device)
@@ -709,13 +765,17 @@ def evaluate(
         # first gather logged samples across all ranks
         for task_output in eval_tasks:
             if log_samples:
-                # for task_name, task_samples in list(samples.items()):
-                full_samples = [None] * WORLD_SIZE if RANK == 0 else None
-                torch.distributed.gather_object(
-                    obj=task_output.logged_samples,
-                    object_gather_list=full_samples,
-                    dst=0,
-                )
+                if uses_megatron_accelerator:
+                    full_samples = lm.accelerator.gather_object(
+                        task_output.logged_samples
+                    )
+                else:
+                    full_samples = [None] * WORLD_SIZE if RANK == 0 else None
+                    torch.distributed.gather_object(
+                        obj=task_output.logged_samples,
+                        object_gather_list=full_samples,
+                        dst=0,
+                    )
 
                 if RANK == 0:
                     task_output.logged_samples = list(
@@ -729,16 +789,24 @@ def evaluate(
             # would otherwise issue fewer `gather_object` collectives than its
             # peers — desyncing the gather and deadlocking the job.
             local_keys = list(task_output.sample_metrics.keys())
-            gathered_keys = [None] * WORLD_SIZE
-            torch.distributed.all_gather_object(gathered_keys, local_keys)
+            if uses_megatron_accelerator:
+                gathered_keys = lm.accelerator.gather_object(local_keys)
+            else:
+                gathered_keys = [None] * WORLD_SIZE
+                torch.distributed.all_gather_object(gathered_keys, local_keys)
             all_keys = sorted({k for keys in gathered_keys for k in keys})
             for metrics in all_keys:
-                metric_list = [None] * WORLD_SIZE if RANK == 0 else None
-                torch.distributed.gather_object(
-                    obj=task_output.sample_metrics.get(metrics, []),
-                    object_gather_list=metric_list,
-                    dst=0,
-                )
+                if uses_megatron_accelerator:
+                    metric_list = lm.accelerator.gather_object(
+                        task_output.sample_metrics.get(metrics, [])
+                    )
+                else:
+                    metric_list = [None] * WORLD_SIZE if RANK == 0 else None
+                    torch.distributed.gather_object(
+                        obj=task_output.sample_metrics.get(metrics, []),
+                        object_gather_list=metric_list,
+                        dst=0,
+                    )
                 if RANK == 0:
                     task_output.sample_metrics[metrics] = list(
                         itertools.chain.from_iterable(metric_list)
@@ -824,10 +892,10 @@ def evaluate(
             )
             results_dict["samples"] = dict(samples)
 
-        return results_dict
+        if getattr(lm, "is_main_process", True):
+            return results_dict
 
-    else:
-        return None
+    return None
 
 
 def request_caching_arg_to_dict(cache_requests: str) -> dict:

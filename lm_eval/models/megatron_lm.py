@@ -17,10 +17,13 @@ Parallelism Modes:
        - Model layers are split across GPUs using Tensor Parallelism
        - No data parallelism
 
-    4. Expert Parallelism (EP) for MoE models: EP > 1, TP=1, PP=1, devices=EP
+    4. Tensor + Data Parallelism: 1 < TP < devices, devices divisible by TP
+       - Each TP group is one model replica and lm-eval data worker
+
+    5. Expert Parallelism (EP) for MoE models: EP > 1, PP=1
        - Each GPU holds different experts
        - Tokens are routed via All-to-All communication
-       - EP cannot be combined with TP or PP
+       - EP can be combined with TP; PP remains unsupported
 
 Note: Pipeline Parallelism (PP > 1) is NOT currently supported.
 
@@ -47,9 +50,19 @@ Usage Examples:
         --model_args load=/path/to/ckpt,devices=2,tensor_model_parallel_size=2,tokenizer_model=/path/to/tokenizer.model \
         --tasks arc_easy --batch_size 8
 
+    # Tensor + Data Parallelism (2 TP x 2 DP replicas)
+    torchrun --nproc_per_node=4 -m lm_eval --model megatron_lm \
+        --model_args load=/path/to/ckpt,devices=4,tensor_model_parallel_size=2,tokenizer_model=/path/to/tokenizer.model \
+        --tasks arc_easy --batch_size 8
+
     # Expert Parallelism for MoE models (6 GPUs, EP=6)
     torchrun --nproc_per_node=6 -m lm_eval --model megatron_lm \
-        --model_args load=/path/to/moe_ckpt,devices=6,expert_model_parallel_size=6,tokenizer_model=/path/to/tokenizer.model \
+        --model_args load=/path/to/moe_ckpt,devices=6,expert_model_parallel_size=6,tokenizer_model=/path/to/tokenizer.model,extra_args="--moe-token-dispatcher-type alltoall" \
+        --tasks arc_easy --batch_size 8
+
+    # Tensor + Expert Parallelism (2 TP x 2 EP)
+    torchrun --nproc_per_node=4 -m lm_eval --model megatron_lm \
+        --model_args load=/path/to/moe_ckpt,devices=4,tensor_model_parallel_size=2,expert_model_parallel_size=2,tokenizer_model=/path/to/tokenizer.model,extra_args="--expert-tensor-parallel-size 1 --moe-token-dispatcher-type alltoall --sequence-parallel" \
         --tasks arc_easy --batch_size 8
 """
 
@@ -306,13 +319,14 @@ class MegatronLMEval(LM):
 
         Supported modes:
         1. Data Parallelism: tp=1, pp=1, devices>1 (with optional EP)
-        2. Tensor Parallelism: tp == devices, pp=1
-        3. Single GPU: devices=1
+        2. Tensor Parallelism: tp == devices, pp=1 (with optional EP)
+        3. Tensor + Data Parallelism: devices is divisible by tp (with optional EP)
+        4. Single GPU: devices=1
 
         For Expert Parallelism (EP > 1):
-        - EP cannot be combined with TP or PP (must have TP=1, PP=1)
+        - EP can be combined with TP
         - devices must be divisible by EP
-        - EP doesn't modify DP, so implicitly this works with both single GPU and data parallel configurations, as long as TP=1 and PP=1.
+        - Megatron validates the checkpoint's expert tensor parallel topology
 
         Note: Pipeline Parallelism (PP > 1) is NOT currently supported.
         """
@@ -321,21 +335,14 @@ class MegatronLMEval(LM):
             f"Pipeline Parallelism (PP={pp}) is not currently supported. "
             f"Please use Tensor Parallelism (TP) or Data Parallelism instead."
         )
+        if tp < 1:
+            raise ValueError(f"Tensor Parallelism (TP={tp}) must be at least 1.")
+        if ep < 1:
+            raise ValueError(f"Expert Parallelism (EP={ep}) must be at least 1.")
 
-        # Validate EP configuration
-        if ep > 1:
-            # EP cannot be combined with TP or PP
-            if tp > 1 or pp > 1:
-                raise ValueError(
-                    f"Expert Parallelism (EP={ep}) cannot be combined with "
-                    f"Tensor Parallelism (TP={tp}) or Pipeline Parallelism (PP={pp}). "
-                    f"Please use EP alone with TP=1, PP=1."
-                )
-            # Match Megatron's requirement that expert groups divide the world size.
-            if devices % ep != 0:
-                raise ValueError(
-                    f"Devices ({devices}) must be divisible by EP ({ep})."
-                )
+        # Match Megatron's requirement that expert groups divide the world size.
+        if ep > 1 and devices % ep != 0:
+            raise ValueError(f"Devices ({devices}) must be divisible by EP ({ep}).")
 
         # At this point, pp == 1 is guaranteed (pp > 1 was rejected above)
         if tp == 1:
@@ -352,14 +359,21 @@ class MegatronLMEval(LM):
                     eval_logger.info(
                         f"Parallelism mode: Data Parallel with {devices} replicas"
                     )
-        elif tp == devices:
-            self._parallelism_mode = "tensor_parallel"
-            eval_logger.info(f"Parallelism mode: Tensor Parallel (TP={tp})")
-        else:
+        elif devices % tp != 0:
             raise ValueError(
                 f"Invalid parallelism configuration: devices={devices}, TP={tp}. "
-                f"For tensor parallelism, TP must equal devices. "
-                f"For data parallelism, set TP=1."
+                "devices must be divisible by TP."
+            )
+        elif tp == devices:
+            self._parallelism_mode = "tensor_parallel"
+            ep_label = f", EP={ep}" if ep > 1 else ""
+            eval_logger.info(f"Parallelism mode: Tensor Parallel (TP={tp}{ep_label})")
+        else:
+            self._parallelism_mode = "tensor_data_parallel"
+            ep_label = f", EP={ep}" if ep > 1 else ""
+            eval_logger.info(
+                f"Parallelism mode: Tensor + Data Parallel "
+                f"(TP={tp}{ep_label}, DP={devices // tp})"
             )
 
     def _initialize_megatron(self, **kwargs):
@@ -487,6 +501,10 @@ class MegatronLMEval(LM):
             self._tp_rank = parallel_state.get_tensor_model_parallel_rank()
             self._pp_rank = parallel_state.get_pipeline_model_parallel_rank()
             self._dp_rank = parallel_state.get_data_parallel_rank()
+            self._dp_world_size = parallel_state.get_data_parallel_world_size()
+            self._dp_group = parallel_state.get_data_parallel_group()
+            self._tp_group = parallel_state.get_tensor_model_parallel_group()
+            self._tp_src_rank = parallel_state.get_tensor_model_parallel_src_rank()
 
             # Set up device and rank info based on parallelism mode
             self._device = torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -633,16 +651,12 @@ class MegatronLMEval(LM):
 
     def _set_parallelism(self, devices: int):
         """Map Megatron parallelism mode to lm-eval rank/world-size semantics."""
-        if self._parallelism_mode == "data_parallel":
-            # Data Parallelism: each rank is a separate worker processing different data.
-            self._rank = self._global_rank
-            self._world_size = devices
-        else:
-            # Model Parallelism (TP/PP): all ranks work together as a single logical worker.
-            # From lm_eval's perspective, this is a single worker because TP/PP handles
-            # computation distribution, not data distribution.
-            self._rank = 0
-            self._world_size = 1
+        # All ranks in one TP group expose the same logical lm-eval DP rank so
+        # they receive identical requests and enter TP collectives together.
+        tp_size = getattr(self, "_tp_size", 1)
+        fallback_rank = self._global_rank if tp_size == 1 else 0
+        self._rank = getattr(self, "_dp_rank", fallback_rank)
+        self._world_size = getattr(self, "_dp_world_size", devices // tp_size)
 
     @property
     def eot_token_id(self) -> int:
@@ -694,9 +708,28 @@ class MegatronLMEval(LM):
         return self._world_size
 
     @property
+    def cache_rank(self) -> int:
+        """Return a process-unique rank for response and request cache files."""
+        return self._global_rank
+
+    @property
+    def is_main_process(self) -> bool:
+        """Return whether this is the sole process allowed to publish results."""
+        return self._global_rank == 0
+
+    uses_megatron_accelerator = True
+
+    @property
+    def requires_uniform_request_groups(self) -> bool:
+        """Keep request-group forward counts equal across EP ranks."""
+        return self._ep_size > 1
+
+    @property
     def accelerator(self):
         """Return accelerator interface for distributed operations (NeMo-style)."""
-        return self._Accelerator(self._world_size, self._device)
+        return self._Accelerator(
+            self._world_size, self._device, getattr(self, "_dp_group", None)
+        )
 
     class _Accelerator:
         """
@@ -705,14 +738,15 @@ class MegatronLMEval(LM):
         Provides NeMo-style interface for synchronization and result gathering.
         """
 
-        def __init__(self, world_size, device):
+        def __init__(self, world_size, device, group=None):
             self.world_size = world_size
             self.device = device
+            self.group = group
 
         def wait_for_everyone(self):
             """Synchronize all processes."""
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
+            if torch.distributed.is_initialized() and self.world_size > 1:
+                torch.distributed.barrier(group=self.group)
 
         def gather(self, local_tensor):
             """Gather tensors from all processes.
@@ -731,7 +765,9 @@ class MegatronLMEval(LM):
             gathered_tensors = [
                 torch.zeros_like(local_tensor) for _ in range(self.world_size)
             ]
-            torch.distributed.all_gather(gathered_tensors, local_tensor)
+            torch.distributed.all_gather(
+                gathered_tensors, local_tensor, group=self.group
+            )
 
             # Concatenate results
             result = torch.cat(gathered_tensors)
@@ -744,8 +780,52 @@ class MegatronLMEval(LM):
                 return [local_obj]
 
             gathered_objects = [None] * self.world_size
-            torch.distributed.all_gather_object(gathered_objects, local_obj)
+            torch.distributed.all_gather_object(
+                gathered_objects, local_obj, group=self.group
+            )
             return gathered_objects
+
+    def _sequence_parallel_enabled(self) -> bool:
+        return self._tp_size > 1 and self._args.sequence_parallel
+
+    def _model_max_length(self) -> int:
+        """Largest usable length that remains divisible by TP for SP."""
+        if not self._sequence_parallel_enabled():
+            return self.max_length
+
+        max_length = self.max_length - (self.max_length % self._tp_size)
+        if max_length == 0:
+            raise ValueError(
+                f"Max length ({self.max_length}) must be at least TP ({self._tp_size}) "
+                "when sequence parallelism is enabled."
+            )
+        return max_length
+
+    def _pad_for_sequence_parallel(self, input_ids, attention_mask):
+        """Left-pad a forward pass so its sequence length is divisible by TP."""
+        if not self._sequence_parallel_enabled():
+            return input_ids, attention_mask
+
+        remainder = input_ids.shape[1] % self._tp_size
+        if remainder == 0:
+            return input_ids, attention_mask
+
+        pad_length = self._tp_size - remainder
+        input_padding = torch.full(
+            (input_ids.shape[0], pad_length),
+            self.eot_token_id,
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        mask_padding = torch.zeros(
+            (attention_mask.shape[0], pad_length),
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
+        return (
+            torch.cat([input_padding, input_ids], dim=1),
+            torch.cat([mask_padding, attention_mask], dim=1),
+        )
 
     def tok_encode(self, string: str, add_special_tokens: bool = False) -> list[int]:
         """Tokenize string."""
@@ -972,9 +1052,10 @@ class MegatronLMEval(LM):
 
             for _, context_enc, continuation_enc in chunk:
                 # Truncate to max length
-                inp = (context_enc + continuation_enc)[-(self.max_length) :]
+                model_max_length = self._model_max_length()
+                inp = (context_enc + continuation_enc)[-model_max_length:]
                 ctxlen = len(context_enc) - max(
-                    0, len(context_enc) + len(continuation_enc) - self.max_length
+                    0, len(context_enc) + len(continuation_enc) - model_max_length
                 )
                 ctxlens.append(ctxlen)
                 contlens.append(len(continuation_enc))
@@ -995,6 +1076,10 @@ class MegatronLMEval(LM):
             attention_mask = torch.tensor(
                 attention_mask_list, dtype=torch.long, device=self.device
             )
+            input_ids, attention_mask = self._pad_for_sequence_parallel(
+                input_ids, attention_mask
+            )
+            max_len = input_ids.shape[1]
 
             # Forward pass (handles TP/PP and EP internally)
             logits = self._model_forward(input_ids, attention_mask=attention_mask)
@@ -1067,7 +1152,7 @@ class MegatronLMEval(LM):
                     get_rolling_token_windows(
                         token_list=self.tok_encode(string),
                         prefix_token=self.eot_token_id,
-                        max_seq_len=self.max_length - 1,
+                        max_seq_len=self._model_max_length() - 1,
                         context_len=1,
                     ),
                 )
@@ -1177,9 +1262,10 @@ class MegatronLMEval(LM):
 
             # Tokenize all contexts
             context_tokens_list = []
+            model_max_length = self._model_max_length()
             for ctx in contexts:
                 tokens = self.tok_encode(ctx)
-                tokens = tokens[-(self.max_length - max_gen_toks) :]
+                tokens = tokens[-(model_max_length - max_gen_toks) :]
                 context_tokens_list.append(tokens)
 
             # Left-pad to same length
@@ -1230,12 +1316,17 @@ class MegatronLMEval(LM):
                         break
 
                 # Truncate if too long
-                if input_ids.shape[1] > self.max_length:
-                    input_ids = input_ids[:, -self.max_length :]
-                    attention_mask = attention_mask[:, -self.max_length :]
+                if input_ids.shape[1] > model_max_length:
+                    input_ids = input_ids[:, -model_max_length:]
+                    attention_mask = attention_mask[:, -model_max_length:]
 
                 # Forward pass - ALL ranks must participate for EP All-to-All sync
-                logits = self._model_forward(input_ids, attention_mask=attention_mask)
+                model_input_ids, model_attention_mask = (
+                    self._pad_for_sequence_parallel(input_ids, attention_mask)
+                )
+                logits = self._model_forward(
+                    model_input_ids, attention_mask=model_attention_mask
+                )
 
                 # Only process results if this rank's batch is not finished
                 if not all(finished):
@@ -1295,9 +1386,13 @@ class MegatronLMEval(LM):
                             next_token_logits, dim=-1, keepdim=True
                         )  # [batch_size, 1]
 
-                    # For Model Parallelism, broadcast next_tokens to all ranks for consistency
-                    if self._parallelism_mode == "model_parallel":
-                        torch.distributed.broadcast(next_tokens, src=0)
+                    # Sampling must make the same choice on every rank in a TP replica.
+                    if self._tp_size > 1:
+                        torch.distributed.broadcast(
+                            next_tokens,
+                            src=self._tp_src_rank,
+                            group=self._tp_group,
+                        )
 
                     # Process each sample in the batch
                     for i in range(actual_batch_size):
