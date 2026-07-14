@@ -127,6 +127,27 @@ def _parse_extra_args(extra_args: str | None) -> list[str]:
         return extra_args.split()
 
 
+def _get_experimental_attention_variant_spec(args, config):
+    """Build an experimental-attention block spec when Megatron supports it."""
+    variant = getattr(args, "experimental_attention_variant", None)
+    if variant is None:
+        return None
+
+    try:
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_transformer_block_with_experimental_attention_variant_spec,
+        )
+    except ImportError as e:
+        megatron_path = os.environ.get("MEGATRON_PATH", "the configured Megatron-LM")
+        raise ImportError(
+            f"Experimental attention variant {variant!r} was requested, but "
+            f"Megatron-LM at {megatron_path!r} does not provide "
+            "get_transformer_block_with_experimental_attention_variant_spec. "
+        ) from e
+
+    return get_transformer_block_with_experimental_attention_variant_spec(config)
+
+
 @register_model("megatron_lm")
 class MegatronLMEval(LM):
     """
@@ -486,11 +507,16 @@ class MegatronLMEval(LM):
                 if config is None:
                     config = core_transformer_config_from_args(args)
 
-                # Select layer spec.
-                # For MoE models, use decoder block spec so each layer follows moe_layer_freq.
+                # Select layer spec. Experimental attention must take precedence over
+                # ordinary MoE because hybrid KDA checkpoints satisfy both conditions.
                 transformer_impl = getattr(args, "transformer_impl", "local")
                 use_transformer_engine = transformer_impl == "transformer_engine"
-                if args.num_experts:
+                if getattr(args, "experimental_attention_variant", None) is not None:
+                    transformer_layer_spec = _get_experimental_attention_variant_spec(
+                        args, config
+                    )
+                elif args.num_experts:
+                    # Use a decoder block spec so each layer follows moe_layer_freq.
                     assert config.transformer_impl != "inference_optimized", (
                         "MoE is not supported with inference_optimized transformer_impl."
                     )
