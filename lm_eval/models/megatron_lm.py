@@ -148,6 +148,24 @@ def _get_experimental_attention_variant_spec(args, config):
     return get_transformer_block_with_experimental_attention_variant_spec(config)
 
 
+def _override_attention_mask_type(transformer_layer_spec, attn_mask_type) -> int:
+    """Override mask types only for attention specs that declare the parameter."""
+    updated = 0
+    layer_specs = getattr(transformer_layer_spec, "layer_specs", None) or (
+        transformer_layer_spec,
+    )
+    for layer_spec in layer_specs:
+        params = getattr(
+            getattr(getattr(layer_spec, "submodules", None), "self_attention", None),
+            "params",
+            None,
+        )
+        if isinstance(params, dict) and "attn_mask_type" in params:
+            params["attn_mask_type"] = attn_mask_type
+            updated += 1
+    return updated
+
+
 @register_model("megatron_lm")
 class MegatronLMEval(LM):
     """
@@ -558,32 +576,9 @@ class MegatronLMEval(LM):
                 )
 
                 try:
-                    updated = 0
-
-                    # Single layer spec.
-                    self_attention = getattr(
-                        getattr(transformer_layer_spec, "submodules", None),
-                        "self_attention",
-                        None,
+                    updated = _override_attention_mask_type(
+                        transformer_layer_spec, AttnMaskType.arbitrary
                     )
-                    params = getattr(self_attention, "params", None)
-                    if isinstance(params, dict):
-                        params["attn_mask_type"] = AttnMaskType.arbitrary
-                        updated += 1
-
-                    # Decoder block spec (list of layer specs).
-                    layer_specs = getattr(transformer_layer_spec, "layer_specs", None)
-                    if layer_specs is not None:
-                        for layer_spec in layer_specs:
-                            layer_self_attention = getattr(
-                                getattr(layer_spec, "submodules", None),
-                                "self_attention",
-                                None,
-                            )
-                            layer_params = getattr(layer_self_attention, "params", None)
-                            if isinstance(layer_params, dict):
-                                layer_params["attn_mask_type"] = AttnMaskType.arbitrary
-                                updated += 1
 
                     if updated == 0:
                         eval_logger.warning(
