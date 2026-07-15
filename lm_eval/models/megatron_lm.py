@@ -801,8 +801,15 @@ class MegatronLMEval(LM):
             )
         return max_length
 
-    def _pad_for_sequence_parallel(self, input_ids, attention_mask):
-        """Left-pad a forward pass so its sequence length is divisible by TP."""
+    def _pad_for_sequence_parallel(
+        self, input_ids, attention_mask, *, padding_side: str = "left"
+    ):
+        """Pad a forward pass so its sequence length is divisible by TP."""
+        if padding_side not in {"left", "right"}:
+            raise ValueError(
+                f"padding_side must be 'left' or 'right', got {padding_side!r}."
+            )
+
         if not self._sequence_parallel_enabled():
             return input_ids, attention_mask
 
@@ -822,9 +829,15 @@ class MegatronLMEval(LM):
             dtype=attention_mask.dtype,
             device=attention_mask.device,
         )
+        if padding_side == "left":
+            return (
+                torch.cat([input_padding, input_ids], dim=1),
+                torch.cat([mask_padding, attention_mask], dim=1),
+            )
+
         return (
-            torch.cat([input_padding, input_ids], dim=1),
-            torch.cat([mask_padding, attention_mask], dim=1),
+            torch.cat([input_ids, input_padding], dim=1),
+            torch.cat([attention_mask, mask_padding], dim=1),
         )
 
     def tok_encode(self, string: str, add_special_tokens: bool = False) -> list[int]:
@@ -1061,25 +1074,25 @@ class MegatronLMEval(LM):
                 contlens.append(len(continuation_enc))
                 inps.append(inp)
 
-            # Pad sequences
+            # Right-pad likelihood inputs so real token positions do not depend on
+            # the lengths of other requests in the batch.
             max_len = max(len(inp) for inp in inps)
             padded_inps = []
             attention_mask_list = []
             for inp in inps:
                 pad_len = max_len - len(inp)
-                padded = [self.eot_token_id] * pad_len + inp
+                padded = inp + [self.eot_token_id] * pad_len
                 padded_inps.append(padded)
                 # Attention mask: 0 for padding, 1 for real tokens
-                attention_mask_list.append([0] * pad_len + [1] * len(inp))
+                attention_mask_list.append([1] * len(inp) + [0] * pad_len)
 
             input_ids = torch.tensor(padded_inps, dtype=torch.long, device=self.device)
             attention_mask = torch.tensor(
                 attention_mask_list, dtype=torch.long, device=self.device
             )
             input_ids, attention_mask = self._pad_for_sequence_parallel(
-                input_ids, attention_mask
+                input_ids, attention_mask, padding_side="right"
             )
-            max_len = input_ids.shape[1]
 
             # Forward pass (handles TP/PP and EP internally)
             logits = self._model_forward(input_ids, attention_mask=attention_mask)
@@ -1088,15 +1101,12 @@ class MegatronLMEval(LM):
             log_probs = torch.nn.functional.log_softmax(logits.float(), dim=-1)
 
             for i, (ctxlen, contlen) in enumerate(zip(ctxlens, contlens, strict=True)):
-                # Get padding length
-                pad_len = max_len - len(inps[i])
-
                 # Compute log probability of continuation
                 cont_log_probs = []
                 greedy_tokens = []
 
-                start_idx = pad_len + ctxlen - 1
-                end_idx = pad_len + ctxlen + contlen - 1
+                start_idx = ctxlen - 1
+                end_idx = ctxlen + contlen - 1
 
                 for j in range(start_idx, end_idx):
                     next_token = input_ids[i, j + 1].item()

@@ -373,6 +373,7 @@ The Megatron-LM backend supports the following parallelism modes:
 > - For EP evaluation, pass the checkpoint's token dispatcher explicitly through `extra_args`; all-to-all is normally required.
 > - EP ranks receive different data shards but execute the same model collectives. Distributed padding is therefore aligned separately for every task and generation-argument group.
 > - With `--sequence-parallel`, Megatron evaluation pads each model forward to a sequence length divisible by TP, including each autoregressive generation step.
+> - Likelihood batches use right padding, including sequence-parallel alignment; the legacy autoregressive generation path remains left padded so each prompt ends at the final tensor position.
 
 **Data Parallelism (4 GPUs, each with full model replica):**
 
