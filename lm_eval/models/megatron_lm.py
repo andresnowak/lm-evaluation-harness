@@ -643,11 +643,115 @@ class MegatronLMEval(LM):
             assert len(self._model) == 1, f"Expected 1 model, got {len(self._model)}"
             self.model = self._model[0]
             self.model.eval()
+            self._initialize_native_generation_engine()
 
             eval_logger.info("Model loaded successfully!")
 
         finally:
             sys.argv = original_argv
+
+    def _initialize_native_generation_engine(self) -> None:
+        """Build the MCore dynamic generation engine, if enabled."""
+        use_dynamic = getattr(self._args, "inference_dynamic_batching", False)
+        if getattr(self._args, "use_legacy_static_engine", False):
+            raise NotImplementedError(
+                "The lm-eval Megatron adapter supports native generation only "
+                "through --inference-dynamic-batching; "
+                "--use-legacy-static-engine is not supported"
+            )
+
+        self._native_generation_engine = None
+        self._native_generation_engine_type = None
+        if not use_dynamic:
+            return
+        if getattr(self._args, "sequence_parallel", False) or getattr(
+            self._args, "context_parallel_size", 1
+        ) > 1:
+            raise NotImplementedError(
+                "Megatron Core native generation in this adapter has not been "
+                "verified with sequence or context parallelism; disable "
+                "--sequence-parallel and use --context-parallel-size 1, or "
+                "disable the native inference engine"
+            )
+        from megatron.core.inference.config import (
+            InferenceConfig,
+            MambaInferenceStateConfig,
+        )
+        from megatron.core.inference.contexts import DynamicInferenceContext
+        from megatron.core.inference.engines import DynamicInferenceEngine
+        from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+            GPTInferenceWrapper,
+        )
+        from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+            TextGenerationController,
+        )
+
+        inference_config = InferenceConfig(
+            block_size_tokens=self._args.inference_dynamic_batching_block_size,
+            buffer_size_gb=self._args.inference_dynamic_batching_buffer_size_gb,
+            max_requests=self._args.inference_dynamic_batching_max_requests,
+            max_tokens=self._args.inference_dynamic_batching_max_tokens,
+            max_sequence_length=self._args.inference_max_seq_length,
+            mamba_inference_state_config=MambaInferenceStateConfig.from_model(
+                self.model
+            ),
+        )
+        context = DynamicInferenceContext(self.model.config, inference_config)
+        wrapped_model = GPTInferenceWrapper(self.model, context)
+        controller = TextGenerationController(wrapped_model, self.tokenizer)
+        self._native_generation_engine = DynamicInferenceEngine(controller, context)
+        self._native_generation_engine_type = "dynamic"
+
+        eval_logger.info(
+            "Using Megatron Core's dynamic inference engine for generate_until",
+        )
+
+    def _native_generate(
+        self,
+        context_tokens: list[list[int]],
+        until: list[str],
+        max_gen_toks: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+    ) -> list[str]:
+        """Generate one lm-eval batch with MCore dynamic inference."""
+        from megatron.core.inference.sampling_params import SamplingParams
+
+        if temperature < 0:
+            raise ValueError(f"temperature must be non-negative, got {temperature}")
+        if temperature == 0:
+            temperature = 1.0
+            top_k = 1
+            top_p = 0.0
+        elif top_k > 0:
+            # MCore treats top-k and top-p as mutually exclusive.
+            top_p = 0.0
+
+        sampling_params = SamplingParams(
+            temperature=float(temperature),
+            top_k=int(top_k),
+            top_p=float(top_p),
+            num_tokens_to_generate=max_gen_toks,
+            termination_id=self.eot_token_id,
+            stop_words=until or None,
+        )
+
+        generated = self._native_generation_engine.generate(
+            prompts=context_tokens,
+            sampling_params=sampling_params,
+        )
+
+        continuations = []
+        for record in generated:
+            result = record.merge()
+            continuation = self.tok_decode(result.generated_tokens)
+            for stop_sequence in until:
+                if stop_sequence in continuation:
+                    continuation = continuation.split(stop_sequence, 1)[0]
+                    break
+            continuations.append(continuation)
+        return continuations
 
     def _set_parallelism(self, devices: int):
         """Map Megatron parallelism mode to lm-eval rank/world-size semantics."""
@@ -1278,6 +1382,28 @@ class MegatronLMEval(LM):
                 tokens = tokens[-(model_max_length - max_gen_toks) :]
                 context_tokens_list.append(tokens)
 
+            if getattr(self, "_native_generation_engine", None) is not None:
+                continuations = self._native_generate(
+                    context_tokens=context_tokens_list,
+                    until=until_list[0],
+                    max_gen_toks=max_gen_toks,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                )
+                for request, continuation in zip(
+                    batch_requests, continuations, strict=True
+                ):
+                    results.append(continuation)
+                    self.cache_hook.add_partial(
+                        "generate_until", request.args, continuation
+                    )
+                pbar.update(actual_batch_size)
+                continue
+
+            # -----------
+            # Run manual generation loop (for non-native inference engine)
+
             # Left-pad to same length
             max_ctx_len = max(len(t) for t in context_tokens_list)
 
@@ -1438,6 +1564,7 @@ class MegatronLMEval(LM):
                         dim=1,
                     )
 
+            # -----------
             # Post-process: decode and truncate at stop sequences
             for i in range(actual_batch_size):
                 continuation = self.tok_decode(generated_tokens[i])
