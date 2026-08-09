@@ -374,6 +374,8 @@ The Megatron-LM backend supports the following parallelism modes:
 > - EP ranks receive different data shards but execute the same model collectives. Distributed padding is therefore aligned separately for every task and generation-argument group.
 > - With `--sequence-parallel`, Megatron evaluation pads each model forward to a sequence length divisible by TP, including each autoregressive generation step.
 > - Likelihood batches use right padding, including sequence-parallel alignment; the legacy autoregressive generation path remains left padded so each prompt ends at the final tensor position.
+> - Eager router metrics use `extra_args="--moe-router-inference-violation-metrics mbs seq"` (optionally `--moe-per-layer-logging`) and log to W&B under `inference/`. They cannot be combined with dynamic batching or CUDA graph replay.
+> - Dynamic likelihood uses `use_inference_engine_for_likelihood=true` with `extra_args="--inference-dynamic-batching --inference-max-seq-length 4096"`. It reserves one context position for a discarded decode token and approximates `is_greedy` from MCore's top-1 payload.
 
 **Data Parallelism (4 GPUs, each with full model replica):**
 

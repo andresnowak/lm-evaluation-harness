@@ -202,6 +202,8 @@ class MegatronLMEval(LM):
         max_gen_toks: Maximum number of tokens to generate
         use_dist_ckpt: Whether to use distributed checkpoint format (auto-detected)
         extra_args: Extra MCore command line arguments, space-separated
+        use_inference_engine_for_likelihood: Use the dynamic inference engine to score
+            likelihood requests. Requires --inference-dynamic-batching.
     """
 
     def __init__(
@@ -225,6 +227,7 @@ class MegatronLMEval(LM):
         max_gen_toks: int = 256,
         use_dist_ckpt: bool | None = None,
         extra_args: str | None = None,
+        use_inference_engine_for_likelihood: bool = False,
         # Model parameters (if not using --use-checkpoint-args)
         num_layers: int | None = None,
         hidden_size: int | None = None,
@@ -256,6 +259,7 @@ class MegatronLMEval(LM):
         self._pp_size = pipeline_model_parallel_size
         self._ep_size = expert_model_parallel_size
         self._devices = devices
+        self._use_inference_engine_for_likelihood = use_inference_engine_for_likelihood
 
         # Validate parallelism configuration (NeMo-style)
         self._validate_parallelism_config(
@@ -489,6 +493,17 @@ class MegatronLMEval(LM):
 
             args = get_args()
             self._args = args
+            self._inference_step = 0
+            self._inference_metrics_defined = False
+            self._consume_inference_router_violation_metrics = None
+            if getattr(args, "moe_router_inference_violation_metrics", []):
+                from megatron.core.transformer.moe.moe_utils import (
+                    consume_inference_router_violation_metrics,
+                )
+
+                self._consume_inference_router_violation_metrics = (
+                    consume_inference_router_violation_metrics
+                )
 
             # Import parallel state utilities after initialization
             from megatron.core import parallel_state
@@ -609,6 +624,10 @@ class MegatronLMEval(LM):
                         "Expected ModuleSpec or decoder block layer specs with self_attention.params."
                     ) from e
 
+                model_kwargs = {}
+                if "pg_collection" in signature(GPTModel).parameters:
+                    model_kwargs["pg_collection"] = pg_collection
+
                 model = GPTModel(
                     config=config,
                     transformer_layer_spec=transformer_layer_spec,
@@ -629,6 +648,7 @@ class MegatronLMEval(LM):
                     seq_len_interpolation_factor=getattr(
                         args, "rotary_seq_len_interpolation_factor", None
                     ),
+                    **model_kwargs,
                 )
 
                 return model
@@ -653,6 +673,9 @@ class MegatronLMEval(LM):
     def _initialize_native_generation_engine(self) -> None:
         """Build the MCore dynamic generation engine, if enabled."""
         use_dynamic = getattr(self._args, "inference_dynamic_batching", False)
+        use_native_likelihood = getattr(
+            self, "_use_inference_engine_for_likelihood", False
+        )
         if getattr(self._args, "use_legacy_static_engine", False):
             raise NotImplementedError(
                 "The lm-eval Megatron adapter supports native generation only "
@@ -662,11 +685,23 @@ class MegatronLMEval(LM):
 
         self._native_generation_engine = None
         self._native_generation_engine_type = None
+        if use_native_likelihood and not use_dynamic:
+            raise ValueError(
+                "use_inference_engine_for_likelihood requires "
+                "--inference-dynamic-batching in extra_args"
+            )
         if not use_dynamic:
             return
-        if getattr(self._args, "sequence_parallel", False) or getattr(
-            self._args, "context_parallel_size", 1
-        ) > 1:
+        if getattr(self._args, "moe_router_inference_violation_metrics", []):
+            raise ValueError(
+                "--inference-dynamic-batching cannot be combined with "
+                "--moe-router-inference-violation-metrics; router metric "
+                "collection is supported only for eager synchronized forwards"
+            )
+        if (
+            getattr(self._args, "sequence_parallel", False)
+            or getattr(self._args, "context_parallel_size", 1) > 1
+        ):
             raise NotImplementedError(
                 "Megatron Core native generation in this adapter has not been "
                 "verified with sequence or context parallelism; disable "
@@ -692,6 +727,7 @@ class MegatronLMEval(LM):
             max_requests=self._args.inference_dynamic_batching_max_requests,
             max_tokens=self._args.inference_dynamic_batching_max_tokens,
             max_sequence_length=self._args.inference_max_seq_length,
+            materialize_only_last_token_logits=(not use_native_likelihood),
             mamba_inference_state_config=MambaInferenceStateConfig.from_model(
                 self.model
             ),
@@ -702,9 +738,7 @@ class MegatronLMEval(LM):
         self._native_generation_engine = DynamicInferenceEngine(controller, context)
         self._native_generation_engine_type = "dynamic"
 
-        eval_logger.info(
-            "Using Megatron Core's dynamic inference engine for generate_until",
-        )
+        eval_logger.info("Megatron Core dynamic inference engine enabled")
 
     def _native_generate(
         self,
@@ -825,8 +859,10 @@ class MegatronLMEval(LM):
 
     @property
     def requires_uniform_request_groups(self) -> bool:
-        """Keep request-group forward counts equal across EP ranks."""
-        return self._ep_size > 1
+        """Keep forward counts equal when collectives span lm-eval workers."""
+        return self._ep_size > 1 or bool(
+            getattr(self._args, "moe_router_inference_violation_metrics", [])
+        )
 
     @property
     def accelerator(self):
@@ -974,6 +1010,46 @@ class MegatronLMEval(LM):
 
         return context_enc, continuation_enc
 
+    def _consume_and_log_inference_router_metrics(self) -> None:
+        """Collect router metrics on every rank, then publish them on rank zero."""
+        consume = getattr(self, "_consume_inference_router_violation_metrics", None)
+        if consume is None:
+            return
+
+        metrics = consume(
+            self.model,
+            pg_collection=getattr(self.model, "pg_collection", None),
+        )
+        self._inference_step += 1
+        if not metrics or not self.is_main_process:
+            return
+
+        run = getattr(sys.modules.get("wandb"), "run", None)
+        if run is None:
+            return
+
+        try:
+            if not self._inference_metrics_defined:
+                previous_step = run.summary.get("inference/inference_step", 0)
+                if isinstance(previous_step, (int, float)):
+                    self._inference_step = max(
+                        self._inference_step, int(previous_step) + 1
+                    )
+                run.define_metric(
+                    "inference/*", step_metric="inference/inference_step"
+                )
+                self._inference_metrics_defined = True
+
+            run.log(
+                {
+                    "inference/inference_step": self._inference_step,
+                    **{f"inference/{key}": value for key, value in metrics.items()},
+                },
+                commit=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            eval_logger.warning("Could not log W&B inference metrics: %s", e)
+
     def _model_forward(
         self,
         input_ids: torch.Tensor,
@@ -1050,6 +1126,7 @@ class MegatronLMEval(LM):
                 position_ids=position_ids,
                 attention_mask=attention_mask,
             )
+            self._consume_and_log_inference_router_metrics()
 
         return output
 
@@ -1121,6 +1198,47 @@ class MegatronLMEval(LM):
 
         return self._loglikelihood_tokens(new_reqs)
 
+    def _native_loglikelihood(
+        self,
+        prompts: list[list[int]],
+        ctxlens: list[int],
+        contlens: list[int],
+    ) -> list[tuple[float, bool]]:
+        """Score ragged token prompts with Megatron's dynamic inference engine."""
+        from megatron.core.inference.sampling_params import SamplingParams
+
+        sampling_params = SamplingParams(
+            num_tokens_to_generate=1,  # Discarded after prompt scoring.
+            termination_id=self.eot_token_id,
+            return_log_probs=True,
+            skip_prompt_log_probs=False,
+            top_n_logprobs=1,
+        )
+        records = self._native_generation_engine.generate(
+            prompts=prompts, sampling_params=sampling_params
+        )
+        assert len(records) == len(prompts)
+
+        answers = []
+        for ctxlen, contlen, record in zip(
+            ctxlens, contlens, records, strict=True
+        ):
+            result = record.merge()
+            start_idx = ctxlen - 1
+            end_idx = ctxlen + contlen - 1
+            selected_log_probs = result.prompt_log_probs[start_idx:end_idx]
+            selected_top_log_probs = result.prompt_top_n_logprobs[start_idx:end_idx]
+            logprob = sum(float(value) for value in selected_log_probs)
+            is_greedy = all(
+                float(value) == max(float(top) for top in top_values.values())
+                for value, top_values in zip(
+                    selected_log_probs, selected_top_log_probs, strict=True
+                )
+            )
+            answers.append((logprob, is_greedy))
+
+        return answers
+
     def _loglikelihood_tokens(
         self,
         requests: list[tuple],
@@ -1162,21 +1280,46 @@ class MegatronLMEval(LM):
             desc="Running loglikelihood requests",
         )
 
+        use_native_likelihood = getattr(
+            self, "_use_inference_engine_for_likelihood", False
+        )
         for chunk in chunks:
             inps = []
             ctxlens = []
             contlens = []
 
             for _, context_enc, continuation_enc in chunk:
-                # Truncate to max length
+                # Native scoring generates and discards one token, so reserve one
+                # position in the engine context beyond the teacher-forced prompt.
                 model_max_length = self._model_max_length()
+                if use_native_likelihood:
+                    engine_max_length = getattr(
+                        getattr(self._native_generation_engine, "context", None),
+                        "max_sequence_length",
+                        model_max_length,
+                    )
+                    model_max_length = min(model_max_length, engine_max_length) - 1
                 inp = (context_enc + continuation_enc)[-model_max_length:]
                 ctxlen = len(context_enc) - max(
                     0, len(context_enc) + len(continuation_enc) - model_max_length
                 )
                 ctxlens.append(ctxlen)
+                if use_native_likelihood and ctxlen < 1:
+                    raise ValueError(
+                        "Continuation is too long to score with the available context"
+                    )
                 contlens.append(len(continuation_enc))
                 inps.append(inp)
+
+            if use_native_likelihood:
+                answers = self._native_loglikelihood(inps, ctxlens, contlens)
+                for i, answer in enumerate(answers):
+                    res.append(answer)
+                    cache_key = chunk[i][0]
+                    if cache_key is not None:
+                        self.cache_hook.add_partial("loglikelihood", cache_key, answer)
+                    pbar.update(1)
+                continue
 
             # Right-pad likelihood inputs so real token positions do not depend on
             # the lengths of other requests in the batch.
@@ -1428,12 +1571,22 @@ class MegatronLMEval(LM):
             generated_tokens = [[] for _ in range(actual_batch_size)]
             finished = [False] * actual_batch_size
 
-            # Autoregressive generation loop
-            # For EP mode: ALL ranks must execute same number of forward passes
+            # Autoregressive generation loop. Collective-enabled forwards require
+            # every participating rank to execute the same number of steps.
             for _step in range(max_gen_toks):
-                # EP synchronization FIRST: check if ALL ranks have ALL samples finished
-                # This MUST be before any early exit to prevent hang
-                if torch.distributed.is_initialized() and self._ep_size > 1:
+                # Cross-rank synchronization must precede early exit whenever
+                # the forward path contains EP or router-metric collectives.
+                needs_cross_rank_step_alignment = (
+                    self._ep_size > 1
+                    or getattr(
+                        self, "_consume_inference_router_violation_metrics", None
+                    )
+                    is not None
+                )
+                if (
+                    torch.distributed.is_initialized()
+                    and needs_cross_rank_step_alignment
+                ):
                     all_finished_local = all(finished)
                     finished_tensor = torch.tensor(
                         [1 if all_finished_local else 0],
