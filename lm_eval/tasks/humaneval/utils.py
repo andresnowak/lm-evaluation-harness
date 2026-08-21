@@ -1,5 +1,8 @@
-import evaluate as hf_evaluate
+import os
 import re
+
+import evaluate as hf_evaluate
+
 
 try:
     compute_ = hf_evaluate.load("code_eval")
@@ -19,6 +22,7 @@ def pass_at_k(references: list[str], predictions: list[list[str]], k: list[int] 
         references=references,
         predictions=predictions,
         k=k,
+        num_workers=int(os.environ.get("CODE_EVAL_NUM_WORKERS", "4")),
     )
     return res[0]
 

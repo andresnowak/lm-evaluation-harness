@@ -1,9 +1,9 @@
+import os
 import re
 from typing import Union
 
 import evaluate as hf_evaluate
 
-import re
 
 try:
     pass_at_k = hf_evaluate.load("code_eval")
@@ -27,6 +27,7 @@ def pass_at_1(
         references=references,
         predictions=predictions,
         k=[1],
+        num_workers=int(os.environ.get("CODE_EVAL_NUM_WORKERS", "4")),
     )[0]["pass@1"]
 
 
