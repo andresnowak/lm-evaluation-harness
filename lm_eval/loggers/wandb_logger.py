@@ -58,6 +58,7 @@ class WandbLogger:
         # pop the step key from the args to save for all logging calls
         self.step = self.wandb_args.pop("step", None)
         self.consumed_tokens = self.wandb_args.pop("consumed_tokens", None)
+        self.total_flops = self.wandb_args.pop("total_flops", None)
 
         # initialize a W&B run
         if wandb.run is None:
@@ -73,6 +74,9 @@ class WandbLogger:
         else:
             step_metric_name = "ConsumedTokens"
             self.step_metrics["ConsumedTokens"] = self.consumed_tokens
+        if self.total_flops is not None:
+            self.step_metrics["flops"] = self.total_flops
+            self.run.define_metric("flops")
         self.run.define_metric(step_metric_name)
         self.run.define_metric("*", step_metric=step_metric_name)
 
