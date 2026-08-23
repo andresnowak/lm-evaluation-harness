@@ -726,12 +726,24 @@ class MegatronLMEval(LM):
             buffer_size_gb=self._args.inference_dynamic_batching_buffer_size_gb,
             max_requests=self._args.inference_dynamic_batching_max_requests,
             max_tokens=self._args.inference_dynamic_batching_max_tokens,
+            num_cuda_graphs=(
+                self._args.inference_dynamic_batching_num_cuda_graphs
+                if self._args.cuda_graph_impl == "local"
+                else None
+            ),
+            cuda_graph_mixed_prefill_count=(
+                self._args.inference_dynamic_batching_cuda_graph_mixed_prefill_count
+            ),
+            use_cuda_graphs_for_non_decode_steps=(
+                not self._args.decode_only_cuda_graphs
+            ),
             max_sequence_length=self._args.inference_max_seq_length,
             materialize_only_last_token_logits=(not use_native_likelihood),
             mamba_inference_state_config=MambaInferenceStateConfig.from_model(
                 self.model
             ),
         )
+        # NOTE: The API will probably change with newer versions of MCore.
         context = DynamicInferenceContext(self.model.config, inference_config)
         wrapped_model = GPTInferenceWrapper(self.model, context)
         controller = TextGenerationController(wrapped_model, self.tokenizer)
