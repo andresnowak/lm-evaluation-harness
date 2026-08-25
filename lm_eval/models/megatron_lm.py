@@ -710,6 +710,7 @@ class MegatronLMEval(LM):
             )
         from megatron.core.inference.config import (
             InferenceConfig,
+            KDAInferenceStateConfig,
             MambaInferenceStateConfig,
         )
         from megatron.core.inference.contexts import DynamicInferenceContext
@@ -742,6 +743,7 @@ class MegatronLMEval(LM):
             mamba_inference_state_config=MambaInferenceStateConfig.from_model(
                 self.model
             ),
+            kda_inference_state_config=KDAInferenceStateConfig.from_model(self.model),
         )
         # NOTE: The API will probably change with newer versions of MCore.
         context = DynamicInferenceContext(self.model.config, inference_config)
