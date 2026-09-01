@@ -663,6 +663,18 @@ class MegatronLMEval(LM):
             assert len(self._model) == 1, f"Expected 1 model, got {len(self._model)}"
             self.model = self._model[0]
             self.model.eval()
+
+            if (
+                getattr(self._args, "moe_use_offloading_experts", False)
+                and getattr(self._args, "moe_use_inplace_fp8_param", False)
+                and getattr(self._args, "moe_offloading_experts_debug_mode", False)
+            ):
+                from megatron.core.transformer.moe.experts_fp8_util import (
+                    FP8GPUExpertsParameterManager,
+                )
+
+                FP8GPUExpertsParameterManager.create_instance(self.model.config)
+
             self._initialize_native_generation_engine()
 
             eval_logger.info("Model loaded successfully!")
