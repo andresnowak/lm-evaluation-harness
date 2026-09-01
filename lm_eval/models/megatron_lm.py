@@ -727,6 +727,7 @@ class MegatronLMEval(LM):
             buffer_size_gb=self._args.inference_dynamic_batching_buffer_size_gb,
             max_requests=self._args.inference_dynamic_batching_max_requests,
             max_tokens=self._args.inference_dynamic_batching_max_tokens,
+            logging_step_interval=self._args.inference_logging_step_interval,
             num_cuda_graphs=(
                 self._args.inference_dynamic_batching_num_cuda_graphs
                 if self._args.cuda_graph_impl == "local"
