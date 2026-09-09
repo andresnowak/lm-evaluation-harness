@@ -1223,7 +1223,7 @@ class MegatronLMEval(LM):
         from megatron.core.inference.sampling_params import SamplingParams
 
         sampling_params = SamplingParams(
-            num_tokens_to_generate=0,  # Prefill-only prompt scoring.
+            num_tokens_to_generate=1,  # Discarded after prompt scoring.
             termination_id=self.eot_token_id,
             return_log_probs=True,
             skip_prompt_log_probs=False,
@@ -1306,12 +1306,14 @@ class MegatronLMEval(LM):
             for _, context_enc, continuation_enc in chunk:
                 model_max_length = self._model_max_length()
                 if use_native_likelihood:
+                    # The engine needs one decode slot to finish the request, but
+                    # that slot must not reduce the model's scoring context.
                     engine_max_length = getattr(
                         getattr(self._native_generation_engine, "context", None),
                         "max_sequence_length",
                         model_max_length,
                     )
-                    model_max_length = min(model_max_length, engine_max_length)
+                    model_max_length = min(model_max_length, engine_max_length - 1)
                 inp = (context_enc + continuation_enc)[-model_max_length:]
                 ctxlen = len(context_enc) - max(
                     0, len(context_enc) + len(continuation_enc) - model_max_length

@@ -13,7 +13,7 @@ class _SamplingParams:
 
 
 class _Engine:
-    def __init__(self, result, max_sequence_length=4):
+    def __init__(self, result, max_sequence_length=8):
         self.result = result
         self.context = SimpleNamespace(max_sequence_length=max_sequence_length)
         self.calls = []
@@ -36,7 +36,7 @@ def _model(monkeypatch, result):
     return model
 
 
-def test_native_likelihood_uses_prefill_only(monkeypatch):
+def test_native_likelihood_generates_one_token_for_engine_completion(monkeypatch):
     result = SimpleNamespace(
         prompt_log_probs=[-0.1, -0.2, -0.3],
         prompt_top_n_logprobs=[{0: -0.1}, {0: -0.2}, {0: -0.3}],
@@ -47,17 +47,17 @@ def test_native_likelihood_uses_prefill_only(monkeypatch):
         pytest.approx((-0.6, True))
     ]
     params = model._native_generation_engine.calls[0]["sampling_params"]
-    assert params.num_tokens_to_generate == 0
+    assert params.num_tokens_to_generate == 1
 
 
-def test_native_likelihood_uses_full_engine_context(monkeypatch):
+def test_native_likelihood_uses_full_model_context_when_engine_is_longer(monkeypatch):
     result = SimpleNamespace(
         prompt_log_probs=[-0.1, -0.2, -0.3],
         prompt_top_n_logprobs=[{0: -0.1}, {0: -0.2}, {0: -0.3}],
     )
     model = _model(monkeypatch, result)
     model._use_inference_engine_for_likelihood = True
-    model._max_length = 8
+    model._max_length = 4
     model._batch_size = 1
     model._global_rank = 0
     model._tp_size = 1
