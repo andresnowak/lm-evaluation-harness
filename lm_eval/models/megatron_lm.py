@@ -1405,21 +1405,23 @@ class MegatronLMEval(LM):
         requests: list[Instance],
         disable_tqdm: bool = False,
     ) -> list[float]:
-        """Compute rolling log-likelihood (for perplexity) with Data Parallelism support."""
-        # Distribute requests for Data Parallelism
+        """Compute rolling log-likelihood with aligned distributed batches."""
         local_requests, sizes = self._distribute_requests(
             [req.args for req in requests]
         )
 
-        loglikelihoods = []
-
-        for (string,) in tqdm(
-            local_requests,
-            disable=disable_tqdm or (self._global_rank != 0),
-            desc="Running loglikelihood_rolling requests",
+        all_windows = []
+        request_window_counts = []
+        for request_idx, (string,) in enumerate(
+            tqdm(
+                local_requests,
+                disable=disable_tqdm or (self._global_rank != 0),
+                desc="Preparing loglikelihood_rolling requests",
+            )
         ):
-            rolling_token_windows = list(
-                map(
+            windows = [
+                (None,) + window
+                for window in map(
                     make_disjoint_window,
                     get_rolling_token_windows(
                         token_list=self.tok_encode(string),
@@ -1428,22 +1430,48 @@ class MegatronLMEval(LM):
                         context_len=1,
                     ),
                 )
-            )
+            ]
+            all_windows.extend((request_idx, window) for window in windows)
+            request_window_counts.append(len(windows))
 
-            rolling_token_windows = [(None,) + x for x in rolling_token_windows]
-            string_nll = self._loglikelihood_tokens(
-                rolling_token_windows, disable_tqdm=True
+        padding_count = 0
+        if self.world_size > 1:
+            local_count = torch.tensor(len(all_windows), device=self.device)
+            gathered_counts = self.accelerator.gather(local_count).cpu().tolist()
+            max_count = max(gathered_counts)
+            padding_count = max_count - gathered_counts[self.rank]
+            if max_count:
+                local_example = all_windows[0][1] if all_windows else None
+                gathered_examples = self.accelerator.gather_object(local_example)
+                padding_window = next(
+                    example for example in gathered_examples if example is not None
+                )
+                all_windows.extend((-1, padding_window) for _ in range(padding_count))
+
+        window_scores = (
+            self._loglikelihood_tokens(
+                [window for _, window in all_windows], disable_tqdm=disable_tqdm
             )
-            string_nll = [x[0] for x in string_nll]
-            string_nll = sum(string_nll)
+            if all_windows
+            else []
+        )
+        if padding_count:
+            window_scores = window_scores[:-padding_count]
+
+        loglikelihoods = []
+        offset = 0
+        for (string,), window_count in zip(
+            local_requests, request_window_counts, strict=True
+        ):
+            string_nll = sum(
+                score for score, _ in window_scores[offset : offset + window_count]
+            )
+            offset += window_count
             loglikelihoods.append(string_nll)
-
             self.cache_hook.add_partial("loglikelihood_rolling", (string,), string_nll)
 
-        # Gather results from all ranks
-        all_results = self._gather_results(loglikelihoods, sizes)
-
-        return all_results
+        assert offset == len(window_scores)
+        return self._gather_results(loglikelihoods, sizes)
 
     def generate_until(
         self,
