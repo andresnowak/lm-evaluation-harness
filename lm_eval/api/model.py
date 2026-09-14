@@ -194,6 +194,45 @@ class LM(abc.ABC):
         return self._world_size
 
     @property
+    def process_rank(self) -> int:
+        """Physical process rank, which may differ from the data-parallel rank."""
+        accelerator = getattr(self, "accelerator", None)
+        return getattr(accelerator, "process_index", self.rank)
+
+    @property
+    def cache_rank(self) -> int:
+        """Process-unique rank used to isolate cache files."""
+        return self.process_rank
+
+    @property
+    def is_main_process(self) -> bool:
+        """Whether this process is responsible for publishing final results."""
+        accelerator = getattr(self, "accelerator", None)
+        return getattr(accelerator, "is_main_process", self.process_rank == 0)
+
+    def all_gather_object(self, obj):
+        """Gather a Python object from every data-parallel worker."""
+        if self.world_size <= 1:
+            return [obj]
+
+        import torch
+
+        gathered = [None] * self.world_size
+        torch.distributed.all_gather_object(gathered, obj)
+        return gathered
+
+    def gather_object(self, obj, dst: int = 0):
+        """Gather a Python object on one data-parallel worker."""
+        if self.world_size <= 1:
+            return [obj]
+
+        import torch
+
+        gathered = [None] * self.world_size if self.rank == dst else None
+        torch.distributed.gather_object(obj, gathered, dst=dst)
+        return gathered
+
+    @property
     def tokenizer_name(self) -> str:
         """Must be defined for LM subclasses which implement Chat Templating.
         Should return the name of the tokenizer or chat template used.

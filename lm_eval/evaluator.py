@@ -279,14 +279,13 @@ def simple_evaluate(
         eval_logger.info("Using pre-initialized model")
         lm = model
 
-    uses_megatron_accelerator = getattr(lm, "uses_megatron_accelerator", False)
-    is_main_process = (
-        lm.is_main_process if uses_megatron_accelerator else lm.rank == 0
-    )
+    is_main_process = lm.is_main_process
 
     if use_cache is not None:
-        cache_rank = lm.cache_rank if uses_megatron_accelerator else lm.rank
-        eval_logger.info(f"Using cache at {use_cache + '_rank' + str(cache_rank) + '.db'}")
+        cache_rank = lm.cache_rank
+        eval_logger.info(
+            f"Using cache at {use_cache + '_rank' + str(cache_rank) + '.db'}"
+        )
         lm = lm_eval.api.model.CachingLM(
             lm,
             use_cache
@@ -542,7 +541,6 @@ def evaluate(
     # end validation check
 
     # Cache the limit arg.
-    uses_megatron_accelerator = getattr(lm, "uses_megatron_accelerator", False)
     requires_uniform_request_groups = getattr(
         lm, "requires_uniform_request_groups", False
     )
@@ -560,7 +558,7 @@ def evaluate(
             else samples,
             rank=lm.rank,
             world_size=lm.world_size,
-            cache_rank=lm.cache_rank if uses_megatron_accelerator else None,
+            cache_rank=lm.cache_rank,
             cache_requests=cache_requests,
             rewrite_requests_cache=rewrite_requests_cache,
             system_instruction=system_instruction,
@@ -759,23 +757,11 @@ def evaluate(
                     task_output.sample_metrics[(metric, filter_key)].append(value)
 
     if WORLD_SIZE > 1:
-        import torch
-
         # if multigpu, then gather data across all ranks to rank 0
         # first gather logged samples across all ranks
         for task_output in eval_tasks:
             if log_samples:
-                if uses_megatron_accelerator:
-                    full_samples = lm.accelerator.gather_object(
-                        task_output.logged_samples
-                    )
-                else:
-                    full_samples = [None] * WORLD_SIZE if RANK == 0 else None
-                    torch.distributed.gather_object(
-                        obj=task_output.logged_samples,
-                        object_gather_list=full_samples,
-                        dst=0,
-                    )
+                full_samples = lm.gather_object(task_output.logged_samples)
 
                 if RANK == 0:
                     task_output.logged_samples = list(
@@ -789,24 +775,12 @@ def evaluate(
             # would otherwise issue fewer `gather_object` collectives than its
             # peers — desyncing the gather and deadlocking the job.
             local_keys = list(task_output.sample_metrics.keys())
-            if uses_megatron_accelerator:
-                gathered_keys = lm.accelerator.gather_object(local_keys)
-            else:
-                gathered_keys = [None] * WORLD_SIZE
-                torch.distributed.all_gather_object(gathered_keys, local_keys)
+            gathered_keys = lm.all_gather_object(local_keys)
             all_keys = sorted({k for keys in gathered_keys for k in keys})
             for metrics in all_keys:
-                if uses_megatron_accelerator:
-                    metric_list = lm.accelerator.gather_object(
-                        task_output.sample_metrics.get(metrics, [])
-                    )
-                else:
-                    metric_list = [None] * WORLD_SIZE if RANK == 0 else None
-                    torch.distributed.gather_object(
-                        obj=task_output.sample_metrics.get(metrics, []),
-                        object_gather_list=metric_list,
-                        dst=0,
-                    )
+                metric_list = lm.gather_object(
+                    task_output.sample_metrics.get(metrics, [])
+                )
                 if RANK == 0:
                     task_output.sample_metrics[metrics] = list(
                         itertools.chain.from_iterable(metric_list)
@@ -892,7 +866,7 @@ def evaluate(
             )
             results_dict["samples"] = dict(samples)
 
-        if getattr(lm, "is_main_process", True):
+        if lm.is_main_process:
             return results_dict
 
     return None

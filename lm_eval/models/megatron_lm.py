@@ -861,29 +861,32 @@ class MegatronLMEval(LM):
         return self._world_size
 
     @property
-    def cache_rank(self) -> int:
-        """Return a process-unique rank for response and request cache files."""
-        return self._global_rank
-
-    @property
-    def is_main_process(self) -> bool:
-        """Return whether this is the sole process allowed to publish results."""
-        return self._global_rank == 0
-
-    uses_megatron_accelerator = True
-
-    @property
     def requires_uniform_request_groups(self) -> bool:
         """Keep forward counts equal when collectives span lm-eval workers."""
         return self._ep_size > 1 or bool(
             getattr(self._args, "moe_router_inference_violation_metrics", [])
         )
 
+    def all_gather_object(self, obj):
+        """Gather an object across Megatron's data-parallel group."""
+        return self.accelerator.gather_object(obj)
+
+    def gather_object(self, obj, dst: int = 0):
+        """Gather an object across Megatron's data-parallel group."""
+        if dst != 0:
+            raise ValueError(
+                "Megatron object gathering only supports destination rank 0"
+            )
+        return self.all_gather_object(obj)
+
     @property
     def accelerator(self):
         """Return accelerator interface for distributed operations (NeMo-style)."""
         return self._Accelerator(
-            self._world_size, self._device, getattr(self, "_dp_group", None)
+            self._world_size,
+            getattr(self, "_device", None),
+            getattr(self, "_dp_group", None),
+            self._global_rank,
         )
 
     class _Accelerator:
@@ -893,10 +896,12 @@ class MegatronLMEval(LM):
         Provides NeMo-style interface for synchronization and result gathering.
         """
 
-        def __init__(self, world_size, device, group=None):
+        def __init__(self, world_size, device, group=None, process_index=0):
             self.world_size = world_size
             self.device = device
             self.group = group
+            self.process_index = process_index
+            self.is_main_process = process_index == 0
 
         def wait_for_everyone(self):
             """Synchronize all processes."""
