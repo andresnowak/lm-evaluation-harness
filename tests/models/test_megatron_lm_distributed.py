@@ -108,34 +108,35 @@ class _InferenceModel(torch.nn.Module):
 
 
 @pytest.fixture(scope="module")
-def four_rank_process_group():
-    """Skip before rendezvous unless invoked under a four-rank torchrun."""
+def distributed_process_group():
+    """Skip before rendezvous unless invoked by a distributed launcher."""
     import torch.distributed as dist
 
     if (
         os.environ.get("RANK") is None
-        or os.environ.get("WORLD_SIZE") != "4"
+        or os.environ.get("WORLD_SIZE") is None
         or os.environ.get("MASTER_ADDR") is None
         or os.environ.get("MASTER_PORT") is None
     ):
-        pytest.skip("requires torchrun with WORLD_SIZE=4")
+        pytest.skip("requires a distributed launcher")
     if not dist.is_available():
         pytest.skip("torch.distributed is unavailable")
 
     initialized_here = False
     if not dist.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend, timeout=timedelta(minutes=2))
+        dist.init_process_group(backend=backend, timeout=timedelta(minutes=5))
         initialized_here = True
-    if dist.get_world_size() != 4:
-        if initialized_here:
-            dist.destroy_process_group()
-        pytest.skip("requires a four-rank process group")
     try:
         yield dist
     finally:
         if initialized_here and dist.is_initialized():
             dist.destroy_process_group()
+
+
+def _require_world_size(dist, expected):
+    if dist.get_world_size() != expected:
+        pytest.skip(f"requires WORLD_SIZE={expected}")
 
 
 def _require_megatron():
@@ -184,9 +185,10 @@ def _fake_next_token_forward(dist, ep_group):
     return forward
 
 
-def test_ep_dp_shards_keep_collectives_aligned(four_rank_process_group):
+def test_ep_dp_shards_keep_collectives_aligned(distributed_process_group):
     """Uneven and empty evaluator shards must still enter EP collectives."""
-    dist = four_rank_process_group
+    dist = distributed_process_group
+    _require_world_size(dist, 4)
     _require_megatron()
     from megatron.core import parallel_state
 
@@ -221,9 +223,10 @@ def test_ep_dp_shards_keep_collectives_aligned(four_rank_process_group):
         parallel_state.destroy_model_parallel()
 
 
-def test_router_metric_collectives_align_with_empty_shards(four_rank_process_group):
+def test_router_metric_collectives_align_with_empty_shards(distributed_process_group):
     """Metric collectors must run equally often on every evaluator rank."""
-    dist = four_rank_process_group
+    dist = distributed_process_group
+    _require_world_size(dist, 4)
     device = _device(dist)
     for count in (dist.get_world_size() + 1, dist.get_world_size() // 2):
         model = _adapter(dist, device)
@@ -261,9 +264,10 @@ def test_router_metric_collectives_align_with_empty_shards(four_rank_process_gro
             assert result is None
 
 
-def test_real_tp_ep_sequence_parallel_model(four_rank_process_group):
+def test_real_tp_ep_sequence_parallel_model(distributed_process_group):
     """Exercise one real TP=2/EP=2 all-to-all model with evaluator DP."""
-    dist = four_rank_process_group
+    dist = distributed_process_group
+    _require_world_size(dist, 4)
     _require_megatron()
     from megatron.core import parallel_state
     from megatron.core.models.gpt import GPTModel
@@ -341,9 +345,11 @@ def test_real_tp_ep_sequence_parallel_model(four_rank_process_group):
         parallel_state.destroy_model_parallel()
 
 
-def test_native_pipeline_parallel_generation_and_likelihood(four_rank_process_group):
+def test_native_pipeline_parallel_generation_and_likelihood(distributed_process_group):
     """Run the native dynamic inference engine across four pipeline stages."""
-    dist = four_rank_process_group
+    dist = distributed_process_group
+    if dist.get_world_size() % 4 != 0:
+        pytest.skip("requires a world size divisible by PP=4")
     if not torch.cuda.is_available():
         pytest.skip("native pipeline inference requires CUDA")
     _require_megatron()
@@ -441,7 +447,8 @@ def test_native_pipeline_parallel_generation_and_likelihood(four_rank_process_gr
         adapter._set_parallelism(dist.get_world_size())
         adapter._model_forward = lambda *args, **kwargs: pytest.fail("eager forward")
 
-        assert (adapter.rank, adapter.world_size) == (0, 1)
+        assert adapter.rank == parallel_state.get_data_parallel_rank()
+        assert adapter.world_size == dist.get_world_size() // 4
         generated = adapter.generate_until(
             [Instance("generate_until", {}, ("ab", {"max_gen_toks": 1}), 0)]
         )
@@ -452,8 +459,12 @@ def test_native_pipeline_parallel_generation_and_likelihood(four_rank_process_gr
         assert torch.isfinite(torch.tensor(likelihood[0][0]))
 
         gathered = [None] * dist.get_world_size()
-        dist.all_gather_object(gathered, (generated, likelihood))
-        assert all(result == gathered[0] for result in gathered)
+        dist.all_gather_object(gathered, (adapter.rank, generated, likelihood))
+        expected_ranks = list(range(adapter.world_size))
+        assert sorted(rank for rank, _, _ in gathered) == sorted(expected_ranks * 4)
+        for rank in expected_ranks:
+            replica_results = [result[1:] for result in gathered if result[0] == rank]
+            assert all(result == replica_results[0] for result in replica_results)
     finally:
         DynamicInferenceContext.ROUNDER = 64
         DynamicInferenceContext.TOKEN_ROUNDER = 64
