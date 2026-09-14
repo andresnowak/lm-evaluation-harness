@@ -30,6 +30,7 @@ class _FakeTokenizer:
 def _bare_model():
     model = MegatronLMEval.__new__(MegatronLMEval)
     model._tp_size = 1
+    model._pp_size = 1
     model._ep_size = 1
     model._args = SimpleNamespace(sequence_parallel=False)
     return model
@@ -50,21 +51,25 @@ def _likelihood_model(*, batch_size=1, tp_size=1, sequence_parallel=False):
 
 def test_parallelism_validation_and_dp_rank_mapping():
     cases = [
-        (1, 1, 1, "single"),
-        (4, 1, 1, "data_parallel"),
-        (4, 4, 1, "tensor_parallel"),
-        (4, 2, 1, "tensor_data_parallel"),
-        (4, 2, 2, "tensor_data_parallel"),
+        (1, 1, 1, 1, "single"),
+        (4, 1, 1, 1, "data_parallel"),
+        (4, 4, 1, 1, "tensor_parallel"),
+        (4, 2, 1, 1, "tensor_data_parallel"),
+        (4, 2, 1, 2, "tensor_data_parallel"),
+        (2, 1, 2, 1, "pipeline_parallel"),
+        (8, 2, 2, 1, "pipeline_parallel"),
     ]
-    for devices, tp, ep, expected in cases:
+    for devices, tp, pp, ep, expected in cases:
         model = _bare_model()
-        model._validate_parallelism_config(devices, tp, 1, ep)
+        model._validate_parallelism_config(devices, tp, pp, ep)
         assert model._parallelism_mode == expected
 
     with pytest.raises(ValueError, match="divisible by EP"):
         _bare_model()._validate_parallelism_config(6, 1, 1, 4)
     with pytest.raises(ValueError, match="divisible by TP"):
         _bare_model()._validate_parallelism_config(5, 2, 1, 1)
+    with pytest.raises(ValueError, match=r"divisible by TP \* PP"):
+        _bare_model()._validate_parallelism_config(6, 2, 2, 1)
 
     model = _bare_model()
     model._tp_size = 2
@@ -271,7 +276,21 @@ def _native_model(result):
 def test_native_generation_maps_greedy_sampling_and_stop_words(monkeypatch):
     _install_sampling_params(monkeypatch)
     model = _native_model(SimpleNamespace(generated_tokens=[4, 5, 6]))
-    assert model._native_generate([[1, 2]], ["<stop>"], 3, 0.0, 1.0, 0) == ["answer"]
+    model._pp_size = 2
+    model._tp_size = 1
+    model._global_rank = 0
+    model._max_length = 8
+    model._max_gen_toks = 3
+    model._batch_size = 1
+    model._args = SimpleNamespace(sequence_parallel=False)
+    model._model_forward = lambda *args, **kwargs: pytest.fail("eager forward")
+    request = Instance(
+        "generate_until",
+        {},
+        ("prompt", {"until": ["<stop>"], "max_gen_toks": 3}),
+        0,
+    )
+    assert model.generate_until([request]) == ["answer"]
     params = model._native_generation_engine.calls[0]["sampling_params"]
     assert (params.temperature, params.top_k, params.top_p) == (1.0, 1, 0.0)
     assert params.stop_words == ["<stop>"]
@@ -310,6 +329,7 @@ def test_loglikelihood_uses_native_engine_without_eager_forward(monkeypatch):
     model._batch_size = 2
     model._global_rank = 0
     model._tp_size = 1
+    model._pp_size = 2
     model._args = SimpleNamespace(sequence_parallel=False)
     model._model_forward = lambda *args, **kwargs: pytest.fail("eager forward")
     results = {
@@ -375,6 +395,22 @@ def test_native_engine_rejects_unsupported_options():
     model._use_inference_engine_for_likelihood = True
     with pytest.raises(ValueError, match="requires --inference-dynamic-batching"):
         model._initialize_native_generation_engine()
+
+
+def test_pipeline_parallelism_requires_native_engine():
+    model = _bare_model()
+    model._pp_size = 2
+    model._args = SimpleNamespace(
+        inference_dynamic_batching=False, use_legacy_static_engine=False
+    )
+    model._use_inference_engine_for_likelihood = False
+    with pytest.raises(NotImplementedError, match="Pipeline parallelism requires"):
+        model._initialize_native_generation_engine()
+
+    with pytest.raises(NotImplementedError, match="Eager forward does not support"):
+        model._model_forward(torch.tensor([[1, 2]]))
+    with pytest.raises(NotImplementedError, match="likelihood requires"):
+        model._loglikelihood_tokens([], disable_tqdm=True)
 
 
 def test_native_engine_rejects_unverified_parallelism():

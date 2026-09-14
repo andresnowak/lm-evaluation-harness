@@ -94,6 +94,12 @@ class _Tokenizer:
         del skip_special_tokens
         return "".join(chr(token - 2 + ord("a")) for token in tokens if token >= 2)
 
+    def tokenize(self, text):
+        return self.encode(text)
+
+    def detokenize(self, tokens, skip_special_tokens=True):
+        return self.decode(tokens, skip_special_tokens=skip_special_tokens)
+
 
 class _InferenceModel(torch.nn.Module):
     def forward(self, input_ids, position_ids, attention_mask):
@@ -101,7 +107,7 @@ class _InferenceModel(torch.nn.Module):
         return torch.zeros((*input_ids.shape, 32), device=input_ids.device)
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def four_rank_process_group():
     """Skip before rendezvous unless invoked under a four-rank torchrun."""
     import torch.distributed as dist
@@ -332,4 +338,124 @@ def test_real_tp_ep_sequence_parallel_model(four_rank_process_group):
         else:
             assert result is None
     finally:
+        parallel_state.destroy_model_parallel()
+
+
+def test_native_pipeline_parallel_generation_and_likelihood(four_rank_process_group):
+    """Run the native dynamic inference engine across four pipeline stages."""
+    dist = four_rank_process_group
+    if not torch.cuda.is_available():
+        pytest.skip("native pipeline inference requires CUDA")
+    _require_megatron()
+    from megatron.core import parallel_state
+    from megatron.core.inference.config import InferenceConfig
+    from megatron.core.inference.contexts import DynamicInferenceContext
+    from megatron.core.inference.engines import DynamicInferenceEngine
+    from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
+        GPTInferenceWrapper,
+    )
+    from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+        TextGenerationController,
+    )
+    from megatron.core.models.gpt import GPTModel
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+    from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    parallel_state.destroy_model_parallel()
+    parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=4,
+        expert_model_parallel_size=1,
+        order="tp-ep-dp-pp",
+    )
+    try:
+        device = _device(dist)
+        DynamicInferenceContext.ROUNDER = 4
+        DynamicInferenceContext.TOKEN_ROUNDER = 4
+        DynamicInferenceContext.REQUEST_ROUNDER = 4
+        model_parallel_cuda_manual_seed(
+            1234,
+            inference_rng_tracker=True,
+            use_cudagraphable_rng=False,
+            force_reset_rng=True,
+        )
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=32,
+            num_attention_heads=4,
+            ffn_hidden_size=64,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=4,
+            sequence_parallel=False,
+            add_bias_linear=True,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            transformer_impl="local",
+            cuda_graph_impl="none",
+            inference_rng_tracker=True,
+            use_cpu_initialization=True,
+        )
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_layer_local_spec(),
+            vocab_size=32,
+            max_sequence_length=16,
+            pre_process=parallel_state.is_pipeline_first_stage(),
+            post_process=parallel_state.is_pipeline_last_stage(),
+            parallel_output=True,
+        ).to(device)
+        for parameter in model.parameters():
+            parameter.data = parameter.data.to(config.params_dtype)
+        model.eval()
+
+        inference_config = InferenceConfig(
+            block_size_tokens=256,
+            buffer_size_gb=0.1,
+            max_requests=4,
+            max_tokens=32,
+            max_sequence_length=16,
+            materialize_only_last_token_logits=False,
+            num_cuda_graphs=None,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+        context = DynamicInferenceContext(model.config, inference_config)
+        wrapped_model = GPTInferenceWrapper(model, context)
+        tokenizer = _Tokenizer()
+        controller = TextGenerationController(wrapped_model, tokenizer)
+        engine = DynamicInferenceEngine(controller, context)
+
+        adapter = _adapter(dist, device)
+        adapter.model = model
+        adapter.tokenizer = tokenizer
+        adapter._pp_size = 4
+        adapter._max_gen_toks = 1
+        adapter._use_inference_engine_for_likelihood = True
+        adapter._native_generation_engine = engine
+        adapter._native_generation_engine_type = "dynamic"
+        adapter._dp_rank = parallel_state.get_data_parallel_rank()
+        adapter._dp_world_size = parallel_state.get_data_parallel_world_size()
+        adapter._dp_group = parallel_state.get_data_parallel_group()
+        adapter._set_parallelism(dist.get_world_size())
+        adapter._model_forward = lambda *args, **kwargs: pytest.fail("eager forward")
+
+        assert (adapter.rank, adapter.world_size) == (0, 1)
+        generated = adapter.generate_until(
+            [Instance("generate_until", {}, ("ab", {"max_gen_toks": 1}), 0)]
+        )
+        likelihood = adapter.loglikelihood(
+            [Instance("loglikelihood", {}, ("a", "b"), 0)]
+        )
+        assert len(generated) == len(likelihood) == 1
+        assert torch.isfinite(torch.tensor(likelihood[0][0]))
+
+        gathered = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered, (generated, likelihood))
+        assert all(result == gathered[0] for result in gathered)
+    finally:
+        DynamicInferenceContext.ROUNDER = 64
+        DynamicInferenceContext.TOKEN_ROUNDER = 64
+        DynamicInferenceContext.REQUEST_ROUNDER = 64
         parallel_state.destroy_model_parallel()

@@ -20,12 +20,14 @@ Parallelism Modes:
     4. Tensor + Data Parallelism: 1 < TP < devices, devices divisible by TP
        - Each TP group is one model replica and lm-eval data worker
 
-    5. Expert Parallelism (EP) for MoE models: EP > 1, PP=1
+    5. Expert Parallelism (EP) for MoE models: EP > 1
        - Each GPU holds different experts
        - Tokens are routed via All-to-All communication
-       - EP can be combined with TP; PP remains unsupported
 
-Note: Pipeline Parallelism (PP > 1) is NOT currently supported.
+    6. Pipeline Parallelism (PP): PP > 1
+       - Requires Megatron's native dynamic inference engine
+       - Likelihood tasks also require use_inference_engine_for_likelihood=True
+       - Virtual pipeline parallelism is not supported
 
 Requirements:
     - Megatron-LM must be installed or accessible via MEGATRON_PATH environment variable
@@ -245,10 +247,16 @@ class MegatronLMEval(LM):
             pipeline_model_parallel_size = PP
         if EP is not None:
             expert_model_parallel_size = EP
-        # Auto-set devices to match TP if not explicitly overridden
-        if (TP is not None or tensor_model_parallel_size > 1) and devices == 1:
-            devices = tensor_model_parallel_size
-            eval_logger.info(f"Auto-setting devices={devices} to match TP={tensor_model_parallel_size}")
+        # Auto-set devices to the minimum TP x PP model-parallel world size.
+        model_parallel_size = tensor_model_parallel_size * pipeline_model_parallel_size
+        if (
+            TP is not None or PP is not None or model_parallel_size > 1
+        ) and devices == 1:
+            devices = model_parallel_size
+            eval_logger.info(
+                f"Auto-setting devices={devices} to match "
+                f"TP={tensor_model_parallel_size}, PP={pipeline_model_parallel_size}"
+            )
 
         self._max_length = seq_length
         self._batch_size = micro_batch_size if micro_batch_size is not None else 1
@@ -277,7 +285,7 @@ class MegatronLMEval(LM):
             # Check iteration directories
             iter_dirs = [d for d in os.listdir(load) if d.startswith("iter_")]
             if iter_dirs:
-                latest_iter = sorted(iter_dirs)[-1]
+                latest_iter = max(iter_dirs)
                 iter_path = os.path.join(load, latest_iter)
                 use_dist_ckpt = _check_dist_ckpt(iter_path)
             else:
@@ -325,31 +333,35 @@ class MegatronLMEval(LM):
         1. Data Parallelism: tp=1, pp=1, devices>1 (with optional EP)
         2. Tensor Parallelism: tp == devices, pp=1 (with optional EP)
         3. Tensor + Data Parallelism: devices is divisible by tp (with optional EP)
-        4. Single GPU: devices=1
+        4. Pipeline Parallelism through Megatron's native dynamic inference engine
+        5. Single GPU: devices=1
 
         For Expert Parallelism (EP > 1):
         - EP can be combined with TP
         - devices must be divisible by EP
         - Megatron validates the checkpoint's expert tensor parallel topology
 
-        Note: Pipeline Parallelism (PP > 1) is NOT currently supported.
+        Pipeline parallelism requires Megatron's native dynamic inference engine.
         """
-        # Validate PP configuration - PP > 1 is not supported
-        assert pp == 1, (
-            f"Pipeline Parallelism (PP={pp}) is not currently supported. "
-            f"Please use Tensor Parallelism (TP) or Data Parallelism instead."
-        )
         if tp < 1:
             raise ValueError(f"Tensor Parallelism (TP={tp}) must be at least 1.")
+        if pp < 1:
+            raise ValueError(f"Pipeline Parallelism (PP={pp}) must be at least 1.")
         if ep < 1:
             raise ValueError(f"Expert Parallelism (EP={ep}) must be at least 1.")
+
+        model_parallel_size = tp * pp
+        if devices % model_parallel_size != 0:
+            raise ValueError(
+                f"Invalid parallelism configuration: devices={devices}, TP={tp}, PP={pp}. "
+                "devices must be divisible by TP * PP."
+            )
 
         # Match Megatron's requirement that expert groups divide the world size.
         if ep > 1 and devices % ep != 0:
             raise ValueError(f"Devices ({devices}) must be divisible by EP ({ep}).")
 
-        # At this point, pp == 1 is guaranteed (pp > 1 was rejected above)
-        if tp == 1:
+        if tp == 1 and pp == 1:
             if devices == 1:
                 self._parallelism_mode = "single"
                 eval_logger.info("Parallelism mode: Single GPU")
@@ -363,10 +375,12 @@ class MegatronLMEval(LM):
                     eval_logger.info(
                         f"Parallelism mode: Data Parallel with {devices} replicas"
                     )
-        elif devices % tp != 0:
-            raise ValueError(
-                f"Invalid parallelism configuration: devices={devices}, TP={tp}. "
-                "devices must be divisible by TP."
+        elif pp > 1:
+            self._parallelism_mode = "pipeline_parallel"
+            ep_label = f", EP={ep}" if ep > 1 else ""
+            eval_logger.info(
+                f"Parallelism mode: TP={tp}, PP={pp}{ep_label}, "
+                f"DP={devices // model_parallel_size}"
             )
         elif tp == devices:
             self._parallelism_mode = "tensor_parallel"
@@ -493,6 +507,17 @@ class MegatronLMEval(LM):
 
             args = get_args()
             self._args = args
+            if getattr(args, "virtual_pipeline_model_parallel_size", None) is not None:
+                raise NotImplementedError(
+                    "Virtual pipeline parallelism is not supported by the Megatron "
+                    "inference adapter"
+                )
+            if getattr(args, "pipeline_model_parallel_size", 1) > 1 and not getattr(
+                args, "inference_dynamic_batching", False
+            ):
+                raise NotImplementedError(
+                    "Pipeline parallelism requires --inference-dynamic-batching"
+                )
             self._inference_metric_collectors = []
             if getattr(args, "moe_router_inference_violation_metrics", []):
                 from megatron.core.transformer.moe.moe_utils import (
@@ -511,6 +536,9 @@ class MegatronLMEval(LM):
             # Store parallel info
             self._is_pipeline_last_stage = parallel_state.is_pipeline_last_stage()
             self._is_pipeline_first_stage = parallel_state.is_pipeline_first_stage()
+            self._tp_size = parallel_state.get_tensor_model_parallel_world_size()
+            self._pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+            self._ep_size = parallel_state.get_expert_model_parallel_world_size()
             self._tp_rank = parallel_state.get_tensor_model_parallel_rank()
             self._pp_rank = parallel_state.get_pipeline_model_parallel_rank()
             self._dp_rank = parallel_state.get_data_parallel_rank()
@@ -657,8 +685,11 @@ class MegatronLMEval(LM):
             # Load checkpoint
             load_checkpoint(self._model, None, None, strict=True)
 
-            # Extract single model (no virtual pipeline parallelism)
-            assert len(self._model) == 1, f"Expected 1 model, got {len(self._model)}"
+            if len(self._model) != 1:
+                raise NotImplementedError(
+                    "Virtual pipeline parallelism returned multiple local model chunks; "
+                    "the inference adapter supports one chunk per rank"
+                )
             self.model = self._model[0]
             self.model.eval()
             self._initialize_native_generation_engine()
@@ -687,6 +718,10 @@ class MegatronLMEval(LM):
             raise ValueError(
                 "use_inference_engine_for_likelihood requires "
                 "--inference-dynamic-batching in extra_args"
+            )
+        if getattr(self, "_pp_size", 1) > 1 and not use_dynamic:
+            raise NotImplementedError(
+                "Pipeline parallelism requires --inference-dynamic-batching"
             )
         if not use_dynamic:
             return
@@ -804,9 +839,13 @@ class MegatronLMEval(LM):
         # All ranks in one TP group expose the same logical lm-eval DP rank so
         # they receive identical requests and enter TP collectives together.
         tp_size = getattr(self, "_tp_size", 1)
-        fallback_rank = self._global_rank if tp_size == 1 else 0
+        pp_size = getattr(self, "_pp_size", 1)
+        model_parallel_size = tp_size * pp_size
+        fallback_rank = self._global_rank if model_parallel_size == 1 else 0
         self._rank = getattr(self, "_dp_rank", fallback_rank)
-        self._world_size = getattr(self, "_dp_world_size", devices // tp_size)
+        self._world_size = getattr(
+            self, "_dp_world_size", devices // model_parallel_size
+        )
 
     @property
     def eot_token_id(self) -> int:
@@ -1047,18 +1086,10 @@ class MegatronLMEval(LM):
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Model forward pass with Pipeline Parallelism support.
+        Run the eager model forward path.
 
-        Barriers are placed before and after the forward pass to ensure all ranks
-        are synchronized during model computation.
-
-        For PP > 1:
-        - First stage receives input embeddings
-        - Intermediate stages process hidden states
-        - Last stage produces logits
-        - Logits are broadcast to all PP ranks
-
-        For EP > 1 (Expert Parallelism):
+        Pipeline parallelism uses Megatron's native inference engine instead of
+        this method. For EP > 1 (Expert Parallelism):
         - MoE layers use all-to-all communication which provides implicit synchronization
 
         Args:
@@ -1069,6 +1100,12 @@ class MegatronLMEval(LM):
         Returns:
             logits: [batch_size, seq_len, vocab_size] on all ranks
         """
+        if getattr(self, "_pp_size", 1) > 1:
+            raise NotImplementedError(
+                "Eager forward does not support pipeline parallelism; use Megatron's "
+                "native dynamic inference engine"
+            )
+
         batch_size, seq_len = input_ids.shape
 
         # Create causal mask for Megatron format
@@ -1210,9 +1247,7 @@ class MegatronLMEval(LM):
         assert len(records) == len(prompts)
 
         answers = []
-        for ctxlen, contlen, record in zip(
-            ctxlens, contlens, records, strict=True
-        ):
+        for ctxlen, contlen, record in zip(ctxlens, contlens, records, strict=True):
             result = record.merge()
             start_idx = ctxlen - 1
             end_idx = ctxlen + contlen - 1
@@ -1251,6 +1286,15 @@ class MegatronLMEval(LM):
         - MoE layers use all-to-all which provides implicit synchronization
         - lm_eval's evaluator ensures equal request counts across ranks
         """
+        use_native_likelihood = getattr(
+            self, "_use_inference_engine_for_likelihood", False
+        )
+        if getattr(self, "_pp_size", 1) > 1 and not use_native_likelihood:
+            raise NotImplementedError(
+                "Pipeline-parallel likelihood requires "
+                "use_inference_engine_for_likelihood=True"
+            )
+
         # Distribute requests for Data Parallelism
         local_requests, sizes = self._distribute_requests(requests)
 
@@ -1270,9 +1314,6 @@ class MegatronLMEval(LM):
             desc="Running loglikelihood requests",
         )
 
-        use_native_likelihood = getattr(
-            self, "_use_inference_engine_for_likelihood", False
-        )
         for chunk in chunks:
             inps = []
             ctxlens = []
@@ -1624,8 +1665,8 @@ class MegatronLMEval(LM):
                     attention_mask = attention_mask[:, -model_max_length:]
 
                 # Forward pass - ALL ranks must participate for EP All-to-All sync
-                model_input_ids, model_attention_mask = (
-                    self._pad_for_sequence_parallel(input_ids, attention_mask)
+                model_input_ids, model_attention_mask = self._pad_for_sequence_parallel(
+                    input_ids, attention_mask
                 )
                 logits = self._model_forward(
                     model_input_ids, attention_mask=model_attention_mask
