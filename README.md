@@ -428,15 +428,6 @@ lm_eval --model megatron_lm \
 > [!Note]
 > The `--use-checkpoint-args` flag is enabled by default, which loads model architecture parameters from the checkpoint. For checkpoints converted via Megatron-Bridge, this typically includes all necessary model configuration.
 
-Experimental-attention checkpoints are supported when the Megatron-LM checkout
-provides `get_transformer_block_with_experimental_attention_variant_spec`. This
-includes KDA/MoE checkpoints from the
-[`feat/add_kda`](https://github.com/swiss-ai/Megatron-LM-MoE/tree/feat/add_kda)
-branch. Experimental attention is selected before the ordinary MoE layer spec,
-because hybrid KDA checkpoints satisfy both conditions. Until all KDA
-architecture fields are restored by Megatron's `--use-checkpoint-args`, pass
-the missing Megatron flags through `extra_args`.
-
 #### Multi-GPU evaluation with OpenVINO models
 
 Pipeline parallelism during evaluation is supported with OpenVINO models
