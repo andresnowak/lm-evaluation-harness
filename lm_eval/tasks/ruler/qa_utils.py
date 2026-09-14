@@ -75,7 +75,7 @@ def read_squad(
 @cache
 def read_hotpotqa(
     # Original host (curtis.ml.cmu.edu) is defunct; use a HF mirror pinned to an
-    # immutable revision so eval inputs stay reproducible. See issue #3805.
+    # immutable revision so eval inputs stay reproducible. See issue #3805 https://github.com/EleutherAI/lm-evaluation-harness/issues/3805 .
     url="https://huggingface.co/datasets/namlh2004/hotpotqa/resolve/7e54db4656209750ff487f6fdf8e39a66dba136b/hotpot_dev_distractor_v1.json",
 ) -> tuple[list[dict], list[str]]:
     data = download_json(url)
