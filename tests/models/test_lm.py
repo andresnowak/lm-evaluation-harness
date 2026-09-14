@@ -38,3 +38,12 @@ def test_object_gathering_is_a_noop_for_one_worker():
 
     assert lm.all_gather_object({"value": 1}) == [{"value": 1}]
     assert lm.gather_object({"value": 1}) == [{"value": 1}]
+
+
+def test_model_metrics_are_recorded():
+    lm = _DummyLM()
+
+    lm.add_model_metrics({})
+    lm.add_model_metrics({"metric": 1.0})
+
+    assert lm.get_model_metrics() == [{"metric": 1.0}]

@@ -493,15 +493,13 @@ class MegatronLMEval(LM):
 
             args = get_args()
             self._args = args
-            self._inference_step = 0
-            self._inference_metrics_defined = False
-            self._consume_inference_router_violation_metrics = None
+            self._inference_metric_collectors = []
             if getattr(args, "moe_router_inference_violation_metrics", []):
                 from megatron.core.transformer.moe.moe_utils import (
                     consume_inference_router_violation_metrics,
                 )
 
-                self._consume_inference_router_violation_metrics = (
+                self._inference_metric_collectors.append(
                     consume_inference_router_violation_metrics
                 )
 
@@ -692,11 +690,10 @@ class MegatronLMEval(LM):
             )
         if not use_dynamic:
             return
-        if getattr(self._args, "moe_router_inference_violation_metrics", []):
+        if getattr(self, "_inference_metric_collectors", []):
             raise ValueError(
-                "--inference-dynamic-batching cannot be combined with "
-                "--moe-router-inference-violation-metrics; router metric "
-                "collection is supported only for eager synchronized forwards"
+                "--inference-dynamic-batching cannot be combined with eager "
+                "inference metric collection"
             )
         if (
             getattr(self._args, "sequence_parallel", False)
@@ -864,7 +861,7 @@ class MegatronLMEval(LM):
     def requires_uniform_request_groups(self) -> bool:
         """Keep forward counts equal when collectives span lm-eval workers."""
         return self._ep_size > 1 or bool(
-            getattr(self._args, "moe_router_inference_violation_metrics", [])
+            getattr(self, "_inference_metric_collectors", [])
         )
 
     def all_gather_object(self, obj):
@@ -1030,45 +1027,18 @@ class MegatronLMEval(LM):
 
         return context_enc, continuation_enc
 
-    def _consume_and_log_inference_router_metrics(self) -> None:
-        """Collect router metrics on every rank, then publish them on rank zero."""
-        consume = getattr(self, "_consume_inference_router_violation_metrics", None)
-        if consume is None:
-            return
-
-        metrics = consume(
-            self.model,
-            pg_collection=getattr(self.model, "pg_collection", None),
-        )
-        self._inference_step += 1
-        if not metrics or not self.is_main_process:
-            return
-
-        run = getattr(sys.modules.get("wandb"), "run", None)
-        if run is None:
-            return
-
-        try:
-            if not self._inference_metrics_defined:
-                previous_step = run.summary.get("inference/inference_step", 0)
-                if isinstance(previous_step, (int, float)):
-                    self._inference_step = max(
-                        self._inference_step, int(previous_step) + 1
-                    )
-                run.define_metric(
-                    "inference/*", step_metric="inference/inference_step"
+    def _collect_inference_metrics(self) -> None:
+        """Collect eager inference metrics on every rank."""
+        metrics = {}
+        for collect in getattr(self, "_inference_metric_collectors", []):
+            metrics.update(
+                collect(
+                    self.model,
+                    pg_collection=getattr(self.model, "pg_collection", None),
                 )
-                self._inference_metrics_defined = True
-
-            run.log(
-                {
-                    "inference/inference_step": self._inference_step,
-                    **{f"inference/{key}": value for key, value in metrics.items()},
-                },
-                commit=True,
             )
-        except Exception as e:  # noqa: BLE001
-            eval_logger.warning("Could not log W&B inference metrics: %s", e)
+        if self.is_main_process:
+            self.add_model_metrics(metrics)
 
     def _model_forward(
         self,
@@ -1146,7 +1116,7 @@ class MegatronLMEval(LM):
                 position_ids=position_ids,
                 attention_mask=attention_mask,
             )
-            self._consume_and_log_inference_router_metrics()
+            self._collect_inference_metrics()
 
         return output
 
@@ -1623,13 +1593,9 @@ class MegatronLMEval(LM):
             # every participating rank to execute the same number of steps.
             for _step in range(max_gen_toks):
                 # Cross-rank synchronization must precede early exit whenever
-                # the forward path contains EP or router-metric collectives.
-                needs_cross_rank_step_alignment = (
-                    self._ep_size > 1
-                    or getattr(
-                        self, "_consume_inference_router_violation_metrics", None
-                    )
-                    is not None
+                # the forward path contains EP or metric collectives.
+                needs_cross_rank_step_alignment = self._ep_size > 1 or bool(
+                    getattr(self, "_inference_metric_collectors", [])
                 )
                 if (
                     torch.distributed.is_initialized()

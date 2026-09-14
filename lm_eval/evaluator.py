@@ -856,6 +856,10 @@ def evaluate(
                 for task_output, limit in zip(eval_tasks, limits, strict=True)
             },
         }
+        model_metrics = lm.get_model_metrics()
+        if model_metrics:
+            results_dict["model_metrics"] = model_metrics
+
         if log_samples:
             # default: hash images
             samples = (

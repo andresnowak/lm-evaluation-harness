@@ -32,6 +32,7 @@ class LM(abc.ABC):
         # set rank and world size to a single process, by default.
         self._rank = 0
         self._world_size = 1
+        self._model_metrics: list[dict[str, Any]] = []
         self.cache_hook: CacheHook = CacheHook(None)
 
     @abc.abstractmethod
@@ -231,6 +232,15 @@ class LM(abc.ABC):
         gathered = [None] * self.world_size if self.rank == dst else None
         torch.distributed.gather_object(obj, gathered, dst=dst)
         return gathered
+
+    def add_model_metrics(self, metrics: dict[str, Any]) -> None:
+        """Record metrics produced by a model backend during evaluation."""
+        if metrics:
+            self._model_metrics.append(metrics)
+
+    def get_model_metrics(self) -> list[dict[str, Any]]:
+        """Return model metrics recorded during evaluation."""
+        return self._model_metrics
 
     @property
     def tokenizer_name(self) -> str:
