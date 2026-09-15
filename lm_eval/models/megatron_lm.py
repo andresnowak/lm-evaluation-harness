@@ -201,6 +201,8 @@ class MegatronLMEval(LM):
         micro_batch_size: Micro batch size (optional, uses checkpoint value if not specified)
         max_gen_toks: Maximum number of tokens to generate
         use_dist_ckpt: Whether to use distributed checkpoint format (auto-detected)
+        use_checkpoint_args: Restore model architecture arguments from the checkpoint. Disable
+            only when supplying a complete architecture explicitly.
         extra_args: Extra MCore command line arguments, space-separated
         use_inference_engine_for_likelihood: Use the dynamic inference engine to score
             likelihood requests. Requires --inference-dynamic-batching.
@@ -226,6 +228,7 @@ class MegatronLMEval(LM):
         micro_batch_size: int = 1,
         max_gen_toks: int = 256,
         use_dist_ckpt: bool | None = None,
+        use_checkpoint_args: bool = True,
         extra_args: str | None = None,
         use_inference_engine_for_likelihood: bool = False,
         # Model parameters (if not using --use-checkpoint-args)
@@ -301,6 +304,7 @@ class MegatronLMEval(LM):
             seq_length=seq_length,
             micro_batch_size=micro_batch_size,
             use_dist_ckpt=use_dist_ckpt,
+            use_checkpoint_args=use_checkpoint_args,
             extra_args=extra_args,
             num_layers=num_layers,
             hidden_size=hidden_size,
@@ -424,13 +428,15 @@ class MegatronLMEval(LM):
             "--no-load-optim",
             "--no-load-rng",
             "--bf16",
-            "--use-checkpoint-args",
             "--no-masked-softmax-fusion",
             "--no-bias-gelu-fusion",
             "--no-bias-dropout-fusion",
             "--attention-softmax-in-fp32",
             "--exit-on-missing-checkpoint",
         ]
+
+        if kwargs["use_checkpoint_args"]:
+            argv.append("--use-checkpoint-args")
 
         argv.extend(["--micro-batch-size", str(kwargs["micro_batch_size"])])
 
