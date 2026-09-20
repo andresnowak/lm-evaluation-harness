@@ -71,7 +71,7 @@ class Run(SubCommand):
             action=SplitArgs,
             help=textwrap.dedent("""
                 Space (or comma-separated) list of task names or groupings.
-                Use 'lm-eval list tasks' to see all available tasks.
+                Use 'lm-eval ls tasks' to see all available tasks.
             """).strip(),
         )
         model_group.add_argument(
@@ -183,6 +183,13 @@ class Run(SubCommand):
             help="Save all model outputs and documents for post-hoc analysis",
         )
         data_group.add_argument(
+            "--log_length_metrics",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="Aggregate per-response response/thinking length into per-task "
+            "metrics in results and W&B (thinking-format flags are always logged).",
+        )
+        data_group.add_argument(
             "--samples",
             "-E",
             default=None,
@@ -198,9 +205,11 @@ class Run(SubCommand):
         cache_group.add_argument(
             "--cache_requests",
             type=request_caching_arg_to_dict,
+            nargs="?",
+            const="true",
             default=None,
-            metavar="{true,refresh,delete}",
-            help="Cache preprocessed prompts (true|refresh|delete)",
+            metavar="true|refresh|delete",
+            help="Cache preprocessed prompts; bare flag defaults to 'true'",
         )
         cache_group.add_argument(
             "--check_integrity",
@@ -280,6 +289,14 @@ class Run(SubCommand):
             help="Weights & Biases config arguments key=val key2=val2",
         )
         logging_group.add_argument(
+            "--trackio_args",
+            default=None,
+            nargs="+",
+            action=MergeDictAction,
+            metavar="<args>",
+            help="Trackio init arguments key=val key2=val2 (e.g. project=my-evals)",
+        )
+        logging_group.add_argument(
             "--hf_hub_log_args",
             default=None,
             nargs="+",
@@ -345,12 +362,14 @@ class Run(SubCommand):
         cfg = EvaluatorConfig.from_cli(args)
 
         from lm_eval import simple_evaluate
-        from lm_eval.loggers import EvaluationTracker, WandbLogger
+        from lm_eval.loggers import EvaluationTracker, TrackioLogger, WandbLogger
         from lm_eval.utils import handle_non_serializable, make_table
 
         # Set up logging
         if cfg.wandb_args:
             wandb_logger = WandbLogger(cfg.wandb_args, cfg.wandb_config_args)
+        if cfg.trackio_args:
+            trackio_logger = TrackioLogger(cfg.trackio_args)
 
         # Set up evaluation tracker
         if cfg.output_path:
@@ -372,8 +391,8 @@ class Run(SubCommand):
 
         # Log task selection (tasks already processed in config)
         if cfg.include_path is not None:
-            eval_logger.info(f"Including path: {cfg.include_path}")
-        eval_logger.info(f"Selected Tasks: {cfg.tasks}")
+            eval_logger.info("Including path: %s", cfg.include_path)
+        eval_logger.info("Selected Tasks: %s", cfg.tasks)
 
         # Run evaluation
         results = simple_evaluate(
@@ -410,6 +429,7 @@ class Run(SubCommand):
             torch_random_seed=cfg.seed[2] if cfg.seed else None,
             fewshot_random_seed=cfg.seed[3] if cfg.seed else None,
             confirm_run_unsafe_code=cfg.confirm_run_unsafe_code,
+            log_length_metrics=cfg.log_length_metrics,
             metadata=cfg.metadata,
         )
 
@@ -433,8 +453,18 @@ class Run(SubCommand):
                     wandb_logger.log_eval_result()
                     if cfg.log_samples:
                         wandb_logger.log_eval_samples(samples)
-                except Exception as e:
-                    eval_logger.info(f"Logging to W&B failed: {e}")
+                except Exception as e:  # noqa: BLE001
+                    eval_logger.info("Logging to W&B failed: %s", e)
+
+            # Trackio logging
+            if cfg.trackio_args:
+                try:
+                    trackio_logger.post_init(results)
+                    trackio_logger.log_eval_result()
+                    if cfg.log_samples:
+                        trackio_logger.log_eval_samples(samples)
+                except Exception as e:  # noqa: BLE001
+                    eval_logger.info("Logging to Trackio failed: %s", e)
 
             # Save results
             evaluation_tracker.save_results_aggregated(
@@ -442,7 +472,7 @@ class Run(SubCommand):
             )
 
             if cfg.log_samples:
-                for task_name, _ in results["configs"].items():
+                for task_name in results["configs"]:
                     evaluation_tracker.save_results_samples(
                         task_name=task_name, samples=samples[task_name]
                     )
@@ -466,3 +496,6 @@ class Run(SubCommand):
 
             if cfg.wandb_args:
                 wandb_logger.run.finish()
+
+            if cfg.trackio_args:
+                trackio_logger.finish()

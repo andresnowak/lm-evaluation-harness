@@ -919,7 +919,8 @@ class MegatronLMEval(LM):
             raise ValueError(
                 "Megatron object gathering only supports destination rank 0"
             )
-        return self.all_gather_object(obj)
+        gathered = self.all_gather_object(obj)
+        return gathered if self.rank == dst else None
 
     @property
     def accelerator(self):
@@ -930,6 +931,14 @@ class MegatronLMEval(LM):
             getattr(self, "_dp_group", None),
             self._global_rank,
         )
+
+    def all_gather(self, tensor: torch.Tensor) -> torch.Tensor:
+        """All-gather a tensor across data-parallel ranks."""
+        return self.accelerator.gather(tensor)
+
+    def barrier(self) -> None:
+        """Synchronize processes."""
+        self.accelerator.wait_for_everyone()
 
     class _Accelerator:
         """

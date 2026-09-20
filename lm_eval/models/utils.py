@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import fnmatch
 import itertools
 import logging
+import re
 import time
 from functools import wraps
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
     Literal,
     TypeVar,
 )
-
 from typing_extensions import TypedDict
 
 from lm_eval.utils import maybe_warn, warning_once
@@ -39,13 +41,11 @@ class GenKwargs(TypedDict, total=False):
     __extra_items__: Any
 
 
-def chunks(iter, n: int = 0, fn=None):
-    """
-    Divides an iterable into chunks of specified size or based on a given function.
-    Useful for batching
+def chunks(_iter, n: int = 0, fn=None):
+    """Divides an iterable into chunks of specified size or based on a given function. Useful for batching.
 
-    Parameters:
-    - iter: The input iterable to be divided into chunks.
+    Args:
+    - _iter: The input iterable to be divided into chunks.
     - n: An integer representing the size of each chunk. Default is 0.
     - fn: A function that takes the current index and the iterable as arguments and returns the size of the chunk. Default is None.
 
@@ -67,9 +67,9 @@ def chunks(iter, n: int = 0, fn=None):
     ```
     """
     arr = []
-    for i, x in enumerate(iter):
+    for i, x in enumerate(_iter):
         arr.append(x)
-        if len(arr) == (fn(i, iter) if fn else n):
+        if len(arr) == (fn(i, _iter) if fn else n):
             yield arr
             arr = []
 
@@ -87,7 +87,7 @@ class MultiChoice:
             if len(fnmatch.filter(self.choices, value)) == 0:
                 eval_logger.info("Available tasks to choose:")
                 for choice in self.choices:
-                    eval_logger.info(f"  - {choice}")
+                    eval_logger.info("  - %s", choice)
                 raise ValueError(f"'{value}' is not in task list")
         return True
 
@@ -96,9 +96,9 @@ class MultiChoice:
 
 
 class Grouper:
-    """
-    takes an array `arr` and function `fn` and returns a dictionary
-    with keys fn(ob) for each ob in `arr` and with values `self.arr[key]` a list of all
+    """Takes an array `arr` and function `fn` and returns a dictionary with keys fn(ob).
+
+    For each ob in `arr` and with values `self.arr[key]` a list of all
     objects in `arr` satisfying `key == fn(ob)`.
     """
 
@@ -125,7 +125,7 @@ class Grouper:
         if self._grouped:
             return self._grouped
         grouped = {}
-        for key in self.arr.keys():
+        for key in self.arr:
             # drop the index from each element of self.arr
             grouped[key] = [y[1] for y in self.arr[key]]
         self._grouped = grouped
@@ -141,7 +141,7 @@ class Grouper:
 
         assert grouped_dict.keys() == self.arr.keys()
 
-        for key in grouped_dict.keys():
+        for key in grouped_dict:
             for (ind, _), v in zip(self.arr[key], grouped_dict[key], strict=True):
                 res[ind] = v
                 cov[ind] = True
@@ -154,8 +154,7 @@ class Grouper:
 
 
 def undistribute(iterable):
-    """
-    Undoes https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.distribute .
+    """Undoes https://more-itertools.readthedocs.io/en/stable/api.html#more_itertools.distribute .
 
     Re-interleaves results that have been split using more_itertools.distribute:
         >>> group_1, group_2 = distribute(2, [1, 2, 3, 4, 5, 6])
@@ -183,7 +182,6 @@ def undistribute(iterable):
         [1, 2, 3]
 
     """
-
     return [
         x
         for x in itertools.chain.from_iterable(
@@ -200,7 +198,8 @@ def retry_on_specific_exceptions(
     backoff_multiplier: float = 1.5,
     on_exception_callback: Callable[[Exception, float], Any] | None = None,
 ):
-    """Retry on an LLM Provider's rate limit error with exponential backoff
+    """Retry on an LLM Provider's rate limit error with exponential backoff.
+
     For example, to use for OpenAI, do the following:
     ```
     from openai import RateLimitError
@@ -234,8 +233,7 @@ def retry_on_specific_exceptions(
 
 
 class Collator:
-    """
-    A class for reordering and batching elements of an array.
+    """A class for reordering and batching elements of an array.
 
     This class allows for sorting an array based on a provided sorting function, grouping elements based on a grouping function, and generating batches from the sorted and grouped data.
 
@@ -282,15 +280,15 @@ class Collator:
     def get_batched(
         self, n: int = 1, batch_fn: Callable[[int, Iterable[T]], int] | None = None
     ) -> Iterator[T]:
-        """
-        Generates and yields batches from the reordered array. The method of grouping and batching
-        depends on the parameter `group_by`.
+        """Generates and yields batches from the reordered array.
+
+        The method of grouping and batching depends on the parameter `group_by`.
         If `group_by` is set to "gen_kwargs", it will batch the
         re-ordered values with same gen_kwargs for each batch.
         If `group_by` is "contexts", it caches the requests by context before batching.
-        If `group_by` is neither "gen_kwargs" nor "contexts", it yields the reordered array
+        If `group_by` is neither "gen_kwargs" nor "contexts", it yields the reordered array.
 
-        Parameters:
+        Args:
         - n (int): The size of each batch. Defaults to 1.
         - batch_fn ([Callable[[int, Iterable], int]] | None): A function to determine the size of
           each batch. Defaults to None.
@@ -303,10 +301,7 @@ class Collator:
         List of batched elements according to the `group_by` attribute.
         """
         if self._group_by == "gen_kwargs":
-            for (
-                _,
-                values,
-            ) in self._arr_with_indices.items():  # type: ignore
+            for values in self._arr_with_indices.values():  # type: ignore
                 values = self._reorder(values)
                 batch = self.get_chunks(values, n=n, fn=batch_fn)
                 yield from batch
@@ -333,8 +328,7 @@ class Collator:
         cont_toks: list[int],
         logits: torch.Tensor,
     ) -> Iterator[tuple[tuple[str, str], list[int], torch.Tensor]]:
-        """
-        Retrieves cached single-token continuations and their associated arguments, updating indices as necessary.
+        """Retrieves cached single-token continuations and their associated arguments, updating indices as necessary.
 
         The behavior of this function varies depending on how the `group_by` attribute is set:
 
@@ -388,10 +382,9 @@ class Collator:
             yield req_str, cont_toks, logits
 
     def _reorder(self, arr: list | tuple[tuple[int, Any], ...]) -> Iterator:
-        """
-        Reorders the elements in the array based on the sorting function.
+        """Reorders the elements in the array based on the sorting function.
 
-        Parameters:
+        Args:
         - arr (list | tuple[tuple[int, Any], ...]]): The array or iterable to be reordered.
 
         Yields:
@@ -404,10 +397,9 @@ class Collator:
         yield from [x[1] for x in arr]
 
     def get_original(self, newarr: list) -> list:
-        """
-        Restores the original order of elements from the reordered list.
+        """Restores the original order of elements from the reordered list.
 
-        Parameters:
+        Args:
         - newarr (list): The reordered array.
 
         Returns:
@@ -433,9 +425,7 @@ class Collator:
         fn: Callable[[T], Sequence[T] | dict],
         group_by: Literal["gen_kwargs", "contexts"] = "gen_kwargs",
     ) -> dict:
-        """
-        Groups elements of an iterable based on a provided function.
-
+        """Groups elements of an iterable based on a provided function.
 
         The `group_by` parameter determines the method of grouping.
         If `group_by` is "contexts", the elements are grouped by [context + cont][:-1].
@@ -474,12 +464,10 @@ class Collator:
     def get_chunks(
         _iter, n: int = 0, fn: Callable[[int, Iterable[T]], int] | None = None
     ) -> Iterator[T]:
-        """
-        Divides an iterable into chunks of specified size or based on a given function.
-        Useful for batching
+        """Divides an iterable into chunks of specified size or based on a given function. Useful for batching.
 
-        Parameters:
-        - iter: The input iterable to be divided into chunks.
+        Args:
+        - _iter: The input iterable to be divided into chunks.
         - n: An integer representing the size of each chunk. Default is 0.
         - fn: A function that takes the current index and the iterable as arguments and returns the size of the chunk. Default is None.
 
@@ -516,9 +504,7 @@ def configure_pad_token(
     tokenizer: PreTrainedTokenizerBase,
     model_config: PretrainedConfig | None = None,
 ) -> PreTrainedTokenizerBase:
-    """
-    This function checks if the (Hugging Face) tokenizer has a padding token and sets it if not present.
-    Some tokenizers require special handling.
+    """This function checks if the (Hugging Face) tokenizer has a padding token and sets it if not present. Some tokenizers require special handling.
 
     Args:
         tokenizer: The tokenizer for which the padding token is to be handled.
@@ -530,17 +516,19 @@ def configure_pad_token(
     Raises:
         AssertionError: If the tokenizer is of type RWKVWorldTokenizer or Rwkv5Tokenizer and the padding token id is not 0.
     """
-    if tokenizer.pad_token:
+    if getattr(tokenizer, "pad_token_id", None) is not None or getattr(
+        tokenizer, "pad_token", None
+    ):
         pass
-    elif tokenizer.unk_token:
+    elif getattr(tokenizer, "unk_token", None):
         tokenizer.pad_token_id = tokenizer.unk_token_id
-    elif tokenizer.eos_token:
+    elif getattr(tokenizer, "eos_token", None):
         tokenizer.pad_token_id = tokenizer.eos_token_id
     else:
         # handle special cases
         if model_config and getattr(model_config, "model_type", None) == "qwen":
             # Qwen's trust_remote_code tokenizer does not allow for adding special tokens
-            tokenizer.pad_token = "<|endoftext|>"
+            tokenizer.pad_token = "<|endoftext|>"  # noqa: S105 (pad token, not a secret)
         elif (
             tokenizer.__class__.__name__ == "RWKVWorldTokenizer"
             or tokenizer.__class__.__name__ == "Rwkv5Tokenizer"
@@ -557,10 +545,259 @@ def configure_pad_token(
     return tokenizer
 
 
+def strip_system_boilerplate_from_template(template_source: str | None) -> str | None:
+    r"""Strip Llama 3.x date/knowledge boilerplate from a Jinja chat template.
+
+    Llama 3.x chat templates unconditionally inject "Cutting Knowledge Date"
+    and "Today Date" headers into the system message. For benchmarks that
+    evaluate system-prompt robustness (e.g. TensorTrust) this dilutes
+    prompt authority and causes scores to diverge from paper baselines.
+
+    Three constructs are targeted in the Jinja source:
+      1. The ``{%- if not date_string is defined %}...{%- endif %}`` block
+         (Llama 3.2+ ``strftime_now`` fallback — may contain nested if/endif).
+      2. The ``{{- "Cutting Knowledge Date: ..." }}`` output statement.
+      3. The ``{{- "Today Date: " + date_string + "\\n\\n" }}`` output statement.
+
+    Returns the cleaned template string if any pattern matched, or ``None``
+    if the template was already clean (no patterns found).
+    """
+    if not template_source:
+        return None
+
+    cleaned = template_source
+    changed = False
+
+    # 1. Remove the {%- if not date_string is defined %} ... {%- endif %} block.
+    #    This block may contain nested if/else/endif (Llama 3.2+), so we cannot
+    #    use a single non-greedy regex. Instead, find the opening tag and scan
+    #    forward tracking nesting depth to locate the matching endif.
+    open_pat = re.compile(r"\{%-?\s*if\s+not\s+date_string\s+is\s+defined\s*-?%\}")
+    m = open_pat.search(cleaned)
+    if m:
+        depth = 1
+        pos = m.end()
+        if_tag = re.compile(r"\{%-?\s*if\s")
+        endif_tag = re.compile(r"\{%-?\s*endif\s*-?%\}")
+        while depth > 0 and pos < len(cleaned):
+            next_if = if_tag.search(cleaned, pos)
+            next_endif = endif_tag.search(cleaned, pos)
+            if next_endif is None:
+                break
+            if next_if and next_if.start() < next_endif.start():
+                depth += 1
+                pos = next_if.end()
+            else:
+                depth -= 1
+                if depth == 0:
+                    cleaned = cleaned[: m.start()] + cleaned[next_endif.end() :]
+                    changed = True
+                else:
+                    pos = next_endif.end()
+
+    # 2. Remove {{- "Cutting Knowledge Date: ..." }} output statement.
+    pat2 = re.compile(
+        r"\{\{-?\s*\"Cutting Knowledge Date:.*?\"\s*-?\}\}",
+        re.DOTALL,
+    )
+    result, n = pat2.subn("", cleaned)
+    if n > 0:
+        cleaned = result
+        changed = True
+
+    # 3. Remove {{- "Today Date: " + date_string + "\n\n" }} output statement.
+    pat3 = re.compile(
+        r"\{\{-?\s*\"Today Date:\s*\"\s*\+\s*date_string\s*\+\s*\"\\n\\n\"\s*-?\}\}",
+        re.DOTALL,
+    )
+    result, n = pat3.subn("", cleaned)
+    if n > 0:
+        cleaned = result
+        changed = True
+
+    if changed:
+        eval_logger.info("Stripped Llama 3.x date boilerplate from chat template.")
+        return cleaned
+    return None
+
+
+def maybe_strip_system_boilerplate(
+    chat_template_source: str | None,
+    chat_template_args: dict | None,
+    strip: bool,
+    chat_template_path: str | None = None,
+) -> dict:
+    """Prepare chat-template kwargs and optionally strip system boilerplate.
+
+    If ``chat_template_path`` is provided, or ``chat_template_args`` contains a
+    ``chat_template_path`` key, the file is read and injected as
+    ``chat_template``. If *strip* is true and `chat_template_args` does not
+    already contain a ``chat_template`` key, the tokenizer's template source is
+    run through :func:`strip_system_boilerplate_from_template` and the cleaned
+    version is injected into the returned dict.
+
+    Args:
+        chat_template_source: The raw Jinja template string from the tokenizer.
+        chat_template_args: Existing chat-template keyword arguments (may be None).
+        strip: Whether stripping was requested.
+        chat_template_path: Optional path to a raw Jinja chat-template file.
+
+    Returns:
+        The (possibly updated) ``chat_template_args`` dict — never ``None``.
+    """
+    chat_template_args = dict(chat_template_args or {})
+    nested_path = chat_template_args.pop("chat_template_path", None)
+    if chat_template_path == "":
+        chat_template_path = None
+    if nested_path == "":
+        nested_path = None
+    if chat_template_path is not None and nested_path is not None:
+        raise ValueError(
+            "Specify chat_template_path either as a top-level model arg or inside "
+            "chat_template_args, not both."
+        )
+
+    resolved_path = (
+        chat_template_path if chat_template_path is not None else nested_path
+    )
+    if resolved_path is not None:
+        if "chat_template" in chat_template_args:
+            raise ValueError(
+                "Specify either chat_template_args.chat_template or "
+                "chat_template_path, not both."
+            )
+        path = Path(str(resolved_path)).expanduser()
+        try:
+            chat_template_args["chat_template"] = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ValueError(f"Could not read chat template from {path!s}") from exc
+
+    if not strip:
+        return chat_template_args
+
+    if "chat_template" not in chat_template_args:
+        cleaned = strip_system_boilerplate_from_template(chat_template_source)
+        if cleaned is not None:
+            chat_template_args["chat_template"] = cleaned
+        else:
+            eval_logger.info(
+                "strip_system_boilerplate: no boilerplate patterns found; template unchanged."
+            )
+    return chat_template_args
+
+
+def get_template_special_tokens(tokenizer) -> set[str]:
+    """Collect a tokenizer's structural special tokens for the authority probe.
+
+    Returns the union of ``all_special_tokens`` and ``get_added_vocab()`` keys.
+    The former alone misses header tokens such as Llama's
+    ``<|start_header_id|>``/``<|end_header_id|>`` (only registered in the added
+    vocab), while sentencepiece specials (``<s>``/``</s>``) live only in the
+    former. Missing or non-standard tokenizer APIs (e.g. vLLM's Mistral
+    tokenizer) are tolerated — whatever is available is returned.
+    """
+    tokens: set[str] = set()
+    with contextlib.suppress(Exception):
+        tokens |= set(getattr(tokenizer, "all_special_tokens", None) or [])
+    get_added = getattr(tokenizer, "get_added_vocab", None)
+    if callable(get_added):
+        with contextlib.suppress(Exception):
+            tokens |= set(get_added())
+    return tokens
+
+
+def check_system_boilerplate(
+    render_fn: Callable[[list[dict[str, str]]], str],
+    special_tokens: Iterable[str] | None = None,
+) -> None:
+    """Probe a chat template to verify that the system prompt is authoritative.
+
+    A system prompt is "authoritative" when nothing other than the template's
+    own structural framing — role-opening special tokens, the role label, and
+    whitespace/punctuation separators — sits between the system role
+    declaration and the user-supplied system content. Some templates inject
+    extra natural-language text there (e.g. Llama 3.x's "Cutting Knowledge
+    Date" / "Today Date" headers, or a hard-coded preamble), which dilutes the
+    prompt's authority and skews system-prompt-robustness benchmarks.
+
+    The check is template-family agnostic — it works for both special-token
+    templates (Llama, ChatML/Qwen, Phi, Command-R) and plain-text ones
+    (``### System:``):
+
+    1. Render a demo conversation with a unique sentinel as the system content
+       and take everything the template emits before it (the system header).
+    2. Strip the tokenizer's known special tokens from that header — these are
+       legitimate structural markers, whatever family they belong to (e.g.
+       ``<|start_header_id|>``, ``<|im_start|>``, ``<|SYSTEM_TOKEN|>``).
+    3. Remove the role label itself (the one word, ``system``, the template
+       emits to open the turn).
+    4. Whatever remains must contain no alphabetic characters; any letters are
+       natural-language text injected around the system prompt. Whitespace,
+       separators, and punctuation (e.g. ``:``) are fine.
+
+    Stripping the special tokens up front (rather than slicing at the role
+    word) means the check also catches text injected *before* the role label
+    and does not mis-handle templates whose role word lives inside a special
+    token (Command-R).
+
+    Raises ``RuntimeError`` with an actionable message if injection is found.
+
+    Args:
+        render_fn: A callable that takes a list of chat-message dicts and
+            returns the fully rendered template string. Each model backend
+            passes its own ``apply_chat_template`` wrapper here.
+        special_tokens: The tokenizer's known special/added tokens, stripped
+            from the header before the letter check so structural markers are
+            not mistaken for injection. Use :func:`get_template_special_tokens`
+            to build this set from a tokenizer.
+    """
+    role = "system"
+    marker = "__SYS_PROMPT_AUTHORITY_PROBE__"
+    demo = [
+        {"role": role, "content": marker},
+        {"role": "user", "content": "Hello"},
+    ]
+    try:
+        rendered = render_fn(demo)
+    except Exception:
+        # Template doesn't support a system role (or errored) — can't assess.
+        return
+
+    if marker not in rendered:
+        # Template folded/dropped/transformed the system message — can't assess.
+        return
+
+    # The system header is everything the template emits before the content.
+    header = rendered[: rendered.index(marker)]
+
+    # Strip the template's structural special tokens (longest-first so a token
+    # isn't left partially matched by a shorter one), then drop the role label
+    # itself. Anything left should be only whitespace/punctuation; any
+    # alphabetic character is natural-language text injected around the prompt.
+    residual = header
+    for tok in sorted((t for t in (special_tokens or []) if t), key=len, reverse=True):
+        residual = residual.replace(tok, "")
+    residual = re.sub(re.escape(role), "", residual, count=1, flags=re.IGNORECASE)
+
+    if any(ch.isalpha() for ch in residual):
+        raise RuntimeError(
+            "System prompt is not authoritative: the chat template injects "
+            "content between the system role header and the system prompt.\n"
+            "Injected text (with structural tokens and the role label removed):\n"
+            f"---\n{residual.strip()}\n---\n"
+            "This dilutes the system prompt's authority and will skew "
+            "system-prompt-robustness benchmark scores.\n"
+            "To fix, add one of these to model_args:\n"
+            "  strip_system_boilerplate=true  — auto-strip known Llama 3.x date boilerplate\n"
+            "  allow_system_boilerplate=true  — suppress this check (use the template as-is)"
+        )
+
+
 def replace_placeholders(
     string: str, default_placeholder: str, image_token: str, max_images: int
 ):
-    """
+    """Utility to replace <image> placeholder tags by model-specific image tokens like <|image_pad|>.
+
     A utility function used for local multimodal models. It locates all `placeholder` string
     occurrences in the given input `string_` and replaces the first `max_count` instances with
     `replacement`, and all subsequent occurrences with the empty string.
@@ -592,8 +829,8 @@ def replace_placeholders(
 
 
 def flatten_image_list(images: list[list]):
-    """
-    Takes in a list of lists of images, and returns a single list of all images in order.
+    """Takes in a list of lists of images, and returns a single list of all images in order.
+
     Used for some multimodal models like Llava-1.5 which expects this flattened-list format for its image processor.
 
     :param images: A list of lists of PIL images.
@@ -653,7 +890,6 @@ def normalize_gen_kwargs(
         - Model backends may further modify the returned dict as needed (e.g., vLLM
           removes `do_sample` since it uses temperature directly).
     """
-
     import copy
 
     kwargs = copy.deepcopy(gen_kwargs)
@@ -724,8 +960,7 @@ def resize_image(
     min_width: int = 1,
     min_height: int = 1,
 ) -> Image.Image:
-    """
-    Resizes a PIL Image object with flexible options.
+    """Resizes a PIL Image object with flexible options.
 
     Args:
         image: The PIL Image object to resize.
@@ -842,8 +1077,7 @@ def maybe_truncate(
     shrink_gen_toks=False,
     verbose=True,
 ) -> tuple[list[int], int]:
-    """
-    Truncates input tokens and/or reduces max_gen_toks to fit within max_model_len.
+    """Truncates input tokens and/or reduces max_gen_toks to fit within max_model_len.
 
     Strategy:
         1. No truncation needed: If len(tokens) + max_gen_toks <= max_model_len, return as-is.
@@ -907,21 +1141,13 @@ def maybe_truncate(
     return truncate_tokens(tokens, max_ctx_len, side=side), min_gen_toks
 
 
-def postprocess_generated_text(
-    generation: str, stop: list[str] | str | None, think_end_token: str | None
-) -> str:
-    """
-    Post-processes the generated text by stripping stop sequences and optional thinking markers.
+def truncate_before_stops(generation: str, stop: list[str] | str | None) -> str:
+    """Return ``generation`` truncated before the earliest stop sequence.
 
-    Args:
-        generation (str): The generated text to be processed.
-        stop (list[str] | None): Stop sequence(s) to remove. Text is truncated
-            at the first occurrence of any stop sequence.
-        think_end_token (str | None): Token marking end of thinking section. If provided,
-            returns only the text after this token (discarding thinking content).
-
-    Returns:
-        str: The processed generation - text before stop sequences and after thinking sections.
+    The stop-truncation half of :func:`postprocess_generated_text`, split out so callers
+    can reproduce the scoring boundary without the thinking strip. HF uses it to bound
+    per-response measurement to a sequence's own response, dropping the over-generation
+    that whole-batch stopping leaves past the first stop.
     """
     if stop:
         stop = [stop] if isinstance(stop, str) else stop
@@ -929,11 +1155,339 @@ def postprocess_generated_text(
             if len(term) > 0:
                 # ignore '' separator,
                 # for seq2seq case where self.tok_decode(self.eot_token_id) = ''
-                generation = generation.split(term)[0]
+                # `partition` stops at the FIRST match; `split` would materialise every
+                # segment, which is costly on looping/degenerate output where a short
+                # stop recurs thousands of times.
+                generation = generation.partition(term)[0]
+    return generation
+
+
+def postprocess_generated_text(
+    generation: str, stop: list[str] | str | None, think_end_token: str | None
+) -> str:
+    """Post-processes the generated text by stripping stop sequences and optional thinking markers.
+
+    Args:
+        generation (str): The generated text to be processed.
+        stop (list[str] | str | None): Stop sequence(s) to remove. Text is truncated
+            at the first occurrence of any stop sequence.
+        think_end_token (str | None): Token marking end of thinking section. If provided,
+            returns only the text after this token (discarding thinking content).
+
+    Returns:
+        str: The processed generation - text before stop sequences and after thinking sections.
+    """
+    generation = truncate_before_stops(generation, stop)
     if think_end_token:
         generation = generation.split(think_end_token)[-1].lstrip()
 
     return generation
+
+
+def compute_generation_length_info(
+    raw_text: str,
+    token_ids: Sequence | None = None,
+    think_end_token: str | None = None,
+    tokenizer: Any = None,
+    measure_thinking: bool = True,
+) -> dict:
+    """Length of a generation, and of its thinking span, for per-sample logging.
+
+    Measured before ``postprocess_generated_text`` strips the reasoning, so both survive
+    thinking-mode scoring. The response covers the whole generation (reasoning + answer);
+    the thinking span ends at the LAST ``think_end_token`` — the boundary the strip uses.
+
+    Always emits ``response_length_{words,chars}``, plus ``_tokens`` = ``len(token_ids)``
+    when given. Emits ``thinking_length_{words,chars}`` — plus ``_tokens``, a best-effort
+    re-encode, when ``tokenizer`` is given — only if ``measure_thinking`` and the text
+    contains a close. Callers set ``measure_thinking`` only for well-formed responses, so
+    the span is never mis-attributed (e.g. a turn closing a block opened in a prior turn).
+
+    ``raw_text``/``token_ids`` are the caller's view: vllm/sglang pass the engine's
+    per-response text and exact ids; hf passes a view bounded to the response (pad/eos
+    tail and post-stop over-generation removed). Never raises.
+    """
+    info: dict = {}
+    with contextlib.suppress(Exception):
+        info["response_length_words"] = len(raw_text.split())
+        info["response_length_chars"] = len(raw_text)
+        if token_ids is not None:
+            info["response_length_tokens"] = len(token_ids)
+        if measure_thinking and think_end_token and think_end_token in raw_text:
+            # up to and including the LAST close, matching the strip
+            thinking_text = raw_text.rsplit(think_end_token, 1)[0] + think_end_token
+            info["thinking_length_words"] = len(thinking_text.split())
+            info["thinking_length_chars"] = len(thinking_text)
+            if tokenizer is not None:
+                # token count is best-effort
+                with contextlib.suppress(Exception):
+                    info["thinking_length_tokens"] = len(
+                        tokenizer.encode(thinking_text, add_special_tokens=False)
+                    )
+    return info
+
+
+def attach_length_info(requests, length_res) -> None:
+    """Attach each per-response generation-info dict back onto its originating
+    Instance (one entry per response, mirroring how ``resps`` are appended).
+    ``length_res`` must already be in the original request order.
+    """
+    for req, info in zip(requests, length_res, strict=True):
+        req.length_info.append(info)
+
+
+def compute_thinking_format_info(
+    generation: str,
+    think_start_token: str | None = None,
+    think_end_token: str | None = None,
+    open_prefilled: bool = False,
+) -> dict:
+    """Whether a generation's reasoning (think) block is well-formed.
+
+    Returns 0/1 flags for per-sample logging (aggregated to a per-task rate). Every check
+    reads the **current turn only**, never the prompt/history, so a prior turn's leaked
+    open cannot inflate the signal:
+
+    - ``has_open`` — opened this turn: emitted in the generation, or injected by the
+      template's generation prompt (``open_prefilled``, a per-model fact). Only emitted
+      when an open token is known.
+    - ``has_close`` — the model emitted the close token.
+    - ``correct`` — open+close model: open and close present, open precedes the LAST
+      close (the strip's boundary), and no re-open after the FIRST close (catches a stray
+      second open, ``</think>...<think>...``). Close-only model (no open token known): it
+      reduces to ``has_close``.
+
+    All keys are prefixed ``thinking_format_``. ``correct`` is emitted whenever the close
+    is known. Never raises.
+    """
+    info: dict = {}
+    with contextlib.suppress(Exception):
+        # The close must be emitted by the model -> search the generation only. Use the
+        # LAST close as the boundary, matching the strip (which keeps text after it).
+        gen_close = generation.rfind(think_end_token) if think_end_token else -1
+        has_close = gen_close != -1
+        if think_end_token:
+            info["thinking_format_has_close"] = int(has_close)
+        if think_start_token:
+            # "Opened this turn" = the model emitted the open, or the template prefilled
+            # it into the generation prompt. The rendered history is NOT consulted.
+            gen_open = generation.find(think_start_token)
+            has_open = open_prefilled or gen_open != -1
+            info["thinking_format_has_open"] = int(has_open)
+            if think_end_token:
+                # open precedes close: a prefilled open is before the generation;
+                # otherwise the open must occur in the generation before the close.
+                open_before_close = open_prefilled or (0 <= gen_open < gen_close)
+                # Re-opened after closing => malformed. Probe from the FIRST close so an
+                # open sitting between two closes is still caught.
+                first_close = generation.find(think_end_token)
+                reopened = has_close and (
+                    generation.find(
+                        think_start_token, first_close + len(think_end_token)
+                    )
+                    != -1
+                )
+                info["thinking_format_correct"] = int(
+                    has_open and has_close and open_before_close and not reopened
+                )
+        elif think_end_token:
+            # Close-only model: well-formedness reduces to "did it close".
+            info["thinking_format_correct"] = int(has_close)
+    return info
+
+
+def build_length_info(
+    generation: str,
+    *,
+    token_ids: Sequence | None = None,
+    think_start_token: str | None = None,
+    think_end_token: str | None = None,
+    tokenizer: Any = None,
+    open_prefilled: bool = False,
+    track_thinking_metrics: bool = False,
+) -> dict:
+    """Per-response length+format dict for the **string-close** generation paths.
+
+    Format-first: the thinking span is measured only for well-formed responses
+    (``thinking_format_correct == 1``). Shared by ``vllm``/``sglang`` and the ``hf``
+    string-close path; the ``hf`` int-token path builds the same dict inline because its
+    close boundary is a token id, not a string — keep the two in sync.
+    """
+    fmt = (
+        compute_thinking_format_info(
+            generation,
+            think_start_token=think_start_token,
+            think_end_token=think_end_token,
+            open_prefilled=open_prefilled,
+        )
+        if track_thinking_metrics
+        else {}
+    )
+    info = compute_generation_length_info(
+        generation,
+        token_ids=token_ids,
+        think_end_token=think_end_token,
+        tokenizer=tokenizer,
+        measure_thinking=bool(fmt.get("thinking_format_correct", 0)),
+    )
+    info.update(fmt)
+    return info
+
+
+def _detect_template_token(chat_template: str | None, var_name: str) -> str | None:
+    """Extract the value of a Jinja ``<var_name> = '...'`` assignment from a chat
+    template (last assignment wins), or None.
+    """
+    if not chat_template:
+        return None
+    matches = re.findall(rf"""\b{var_name}\s*=\s*['"]([^'"]+)['"]""", chat_template)
+    return matches[-1] if matches else None
+
+
+def template_declares_reasoning(chat_template: str | None) -> bool:
+    """Whether a chat template declares reasoning tokens (``inner_token`` /
+    ``outer_token``), i.e. the model is thinking-capable.
+
+    Matches an assignment's *presence* (even an unquoted/variable value), so it is
+    deliberately broader than ``detect_think_*_token``, which extracts only quoted
+    literals. That gap is load-bearing: it lets :func:`resolve_think_tokens` fail loud on
+    a template that declares reasoning but whose token value isn't a parseable literal.
+    Do not "dedupe" the two — it would silence the guard.
+    """
+    if not chat_template:
+        return False
+    return re.search(r"\b(?:inner|outer)_token\s*=", chat_template) is not None
+
+
+def detect_think_start_token(chat_template: str | None) -> str | None:
+    """Derive the reasoning *open* token from a chat template's ``inner_token``
+    declaration (e.g. ``<think>`` / ``<|inner_prefix|>``), or None. See
+    :func:`detect_think_end_token` for the close counterpart.
+    """
+    return _detect_template_token(chat_template, "inner_token")
+
+
+def detect_think_end_token(chat_template: str | None) -> str | None:
+    """Derive the reasoning *close* token from a chat template's ``outer_token``
+    declaration (e.g. ``</think>`` / ``<|inner_suffix|>``), or None. The close drives
+    the strip; :func:`resolve_think_tokens` owns the default/fail-loud behaviour.
+    """
+    return _detect_template_token(chat_template, "outer_token")
+
+
+def resolve_think_tokens(
+    chat_template: str | None,
+    autodetect: bool | None,
+    think_start_token: str | None,
+    think_end_token: str | None,
+) -> tuple[str | None, str | None]:
+    """Resolve the reasoning (open, close) string tokens.
+
+    Caller-forced values always win. Auto-detection from the chat template is gated on
+    ``autodetect``, which is **opt-in** (``autodetect_think_tokens``, default off): when it
+    is falsy the template is not consulted at all, so an unconfigured run resolves no
+    close and therefore gets no strip and no thinking metrics. ``enable_thinking`` plays
+    no part — it is a chat-template argument only.
+
+    The CLOSE is load-bearing: it drives the strip, the thinking span and ``has_close``.
+    Fail loud when auto-detection is on and the template declares reasoning tokens but the
+    close cannot be parsed as a literal — pass ``think_end_token=`` instead, or drop
+    ``autodetect_think_tokens=true``. With detection off (the default) it never fires.
+
+    A missing OPEN is non-fatal: it only costs ``has_open``, and ``correct`` degrades to
+    ``has_close`` (close-only style), so it warns. An open *without* a close warns too —
+    nothing can be stripped or measured. A template declaring no reasoning tokens is a
+    no-op returning ``(None, None)``.
+    """
+    # Caller-forced values always win; consult the template only when autodetect is on.
+    start = think_start_token
+    end = think_end_token
+    if autodetect:
+        if start is None:
+            start = detect_think_start_token(chat_template)
+        if end is None:
+            end = detect_think_end_token(chat_template)
+        if template_declares_reasoning(chat_template):
+            if end is None:
+                raise ValueError(
+                    "Reasoning-token auto-detection is on "
+                    "(autodetect_think_tokens=true) and the chat template declares "
+                    "reasoning tokens, but the reasoning close (think_end_token) could "
+                    "not be auto-detected from the template. Pass think_end_token= "
+                    "explicitly in --model_args, or turn detection off "
+                    "(autodetect_think_tokens=false, the default)."
+                )
+            if start is None:
+                warning_once(
+                    eval_logger,
+                    "The reasoning open token could not be auto-detected from the chat "
+                    "template; the thinking-format has_open metric will not be tracked "
+                    "(correct falls back to has_close, close-only style). Pass "
+                    "think_start_token= in --model_args to track it.",
+                )
+    if start is not None and end is None:
+        # An open alone is useless: the strip and every thinking metric key off the close.
+        warning_once(
+            eval_logger,
+            "A reasoning open token is known but no close token is; the reasoning strip "
+            "and the thinking-format/length metrics stay off (has_close and the thinking "
+            "span are undefined without a close). Pass think_end_token= in --model_args.",
+        )
+    return start, end
+
+
+def resolve_track_thinking_metrics(
+    override: bool | None,
+    think_end_token: str | int | None,
+) -> bool:
+    """Whether to record the ``thinking_format_*`` / ``thinking_length_*`` metrics.
+
+    Derived from the CLOSE token alone: with ``override=None`` (default) track iff a close
+    is known, whether explicitly passed or auto-detected. ``True``/``False`` force it on or
+    off — e.g. off to drop the metrics (and their per-response cost) from a thinking run.
+
+    The close may be a string or (on ``hf``) an integer token id. "Known" means *not None*
+    and not the empty string — never a plain truthiness test, since ``0`` is a valid token
+    id whose falsiness would otherwise silently disable tracking.
+
+    The close is required either way: it defines ``has_close`` and the thinking span, so
+    forcing ``True`` without one warns and returns False. A missing OPEN is fine — the
+    format metric degrades to close-only (``correct == has_close``). ``response_length_*``
+    is unaffected; it is always recorded. ``enable_thinking`` plays no part here: it is a
+    chat-template argument only.
+    """
+    if think_end_token is None or think_end_token == "":
+        if override:
+            warning_once(
+                eval_logger,
+                "track_thinking_metrics=True but no reasoning close token is known; "
+                "thinking metrics stay off. Pass think_end_token= in --model_args.",
+            )
+        return False
+    if override is not None:
+        return bool(override)
+    return True
+
+
+def detect_open_prefilled(render_fn, think_start_token: str | None) -> bool:
+    """Whether the chat template injects the reasoning *open* into the generation prompt
+    (a "prefill" template) rather than the model emitting its own.
+
+    Probed once at init by rendering a trivial user-only chat through the backend's own
+    ``apply_chat_template`` (so ``chat_template_args``/``enable_thinking`` apply): the
+    demo content has no open token, so any occurrence comes from the template scaffold.
+    Feeds ``compute_thinking_format_info(open_prefilled=...)`` so ``has_open`` means
+    "opened this turn" for prefill and non-prefill models alike. Never raises — returns
+    ``False`` on any failure (no chat template, no open token, render error).
+    """
+    if not think_start_token:
+        return False
+    with contextlib.suppress(Exception):
+        rendered = render_fn(
+            [{"role": "user", "content": "x"}], add_generation_prompt=True
+        )
+        return think_start_token in rendered
+    return False
 
 
 def has_bos_prefix(sequence: str, bos_str: str | Iterable[str] | None = None) -> bool:
