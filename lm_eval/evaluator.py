@@ -232,7 +232,7 @@ def simple_evaluate(
     cache_requests: bool = False,
     rewrite_requests_cache: bool = False,
     delete_requests_cache: bool = False,
-    limit: int | float | None = None,
+    limit: float | None = None,
     samples: dict[str, list[int]] | None = None,
     bootstrap_iters: int = 100000,
     check_integrity: bool = False,
@@ -942,7 +942,7 @@ def evaluate(
                 for task_name, acc in eval_results_acc.items()
             }
             all_samples = lm.gather_object(rank_samples, dst=0)
-            if RANK == 0:
+            if lm.is_main_process:
                 for task_name, acc in eval_results_acc.items():
                     acc["logged_samples"] = list(
                         itertools.chain.from_iterable(
@@ -956,7 +956,7 @@ def evaluate(
             for task_name, acc in eval_results_acc.items()
         }
         all_metrics = lm.gather_object(rank_metrics, dst=0)
-        if RANK == 0:
+        if lm.is_main_process:
             for task_name, acc in eval_results_acc.items():
                 metric_keys = {
                     metric_key

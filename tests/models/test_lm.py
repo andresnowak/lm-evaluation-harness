@@ -33,6 +33,17 @@ def test_process_properties_use_accelerator_process_rank():
     assert not lm.is_main_process
 
 
+def test_process_properties_use_global_environment_rank(monkeypatch):
+    lm = _DummyLM()
+    lm._rank = 2
+    monkeypatch.setenv("RANK", "4")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+
+    assert lm.process_rank == 4
+    assert lm.cache_rank == 4
+    assert not lm.is_main_process
+
+
 def test_object_gathering_is_a_noop_for_one_worker():
     lm = _DummyLM()
 

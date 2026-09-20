@@ -4,9 +4,10 @@ import json
 import logging
 import os
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any, Optional, TypeVar
+from typing import TYPE_CHECKING, Any, Optional
 
 from tqdm import tqdm
+from typing_extensions import Self
 
 from lm_eval import utils
 
@@ -18,8 +19,6 @@ if TYPE_CHECKING:
 
 
 eval_logger = logging.getLogger(__name__)
-
-T = TypeVar("T", bound="LM")
 
 
 class LM(abc.ABC):
@@ -53,7 +52,6 @@ class LM(abc.ABC):
             A list of ``(logprob, is_greedy)`` tuples — the log-probability of
             the continuation and whether it would be produced by greedy decoding.
         """
-        pass
 
     @abc.abstractmethod
     def loglikelihood_rolling(self, requests: list["Instance"]) -> list[float]:
@@ -94,7 +92,6 @@ class LM(abc.ABC):
             A list of ``(logprob,)`` tuples — the log-probability of the string
             conditioned on the BOS/EOS token (or ``prefix_token_id``).
         """
-        pass
 
     # TODO: Add an optional max length
     @abc.abstractmethod
@@ -109,7 +106,6 @@ class LM(abc.ABC):
         Returns:
             A list of generated continuation strings, one per request.
         """
-        pass
 
     def apply_chat_template(
         self,
@@ -133,8 +129,8 @@ class LM(abc.ABC):
 
     @classmethod
     def create_from_arg_string(
-        cls: type[T], arg_string: str, additional_config: dict | None = None
-    ) -> T:
+        cls, arg_string: str, additional_config: dict | None = None
+    ) -> Self:
         """Create an LM instance from a comma-separated argument string.
 
         Args:
@@ -151,10 +147,10 @@ class LM(abc.ABC):
 
     @classmethod
     def create_from_arg_obj(
-        cls: type[T],
+        cls,
         arg_dict: dict[str, Any],
         additional_config: dict[str, Any] | None = None,
-    ) -> T:
+    ) -> Self:
         """Create an LM instance from a dictionary of arguments.
 
         Args:
@@ -207,6 +203,8 @@ class LM(abc.ABC):
         accelerator = getattr(self, "accelerator", None)
         if accelerator is not None and hasattr(accelerator, "process_index"):
             return accelerator.process_index
+        if global_rank := os.environ.get("RANK"):
+            return int(global_rank)
         return self.rank or int(os.environ.get("LOCAL_RANK", "0"))
 
     @property
@@ -406,7 +404,6 @@ class TemplateLM(LM):
         Must handle strings that already contain the BOS token when
         ``add_special_tokens`` is None. Otherwise, uses the flag as given.
         """
-        pass
 
     @abc.abstractmethod
     def _loglikelihood_tokens(
